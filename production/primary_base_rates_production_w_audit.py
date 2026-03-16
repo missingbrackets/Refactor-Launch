@@ -1,21 +1,47 @@
+"""
+Primary base rates production pipeline with optional audit trail.
+
+Fits Bayesian learning curves per grouping level, predicts per-vehicle failure
+probabilities (next-launch and full-history), builds dropdown tables, and
+exports CSV/JSON outputs.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+from scipy.stats import beta as _beta
+
 from .data_load_feature_creation import load_and_prepare_data
 from ..utils.grouping_column import select_grouping_columns
 from ..utils.compute_empirical_cumulative_loss import compute_empirical_cumulative_has_loss
 from ..utils.build_dropdown_columns import build_dropdown_rows_for_grouping, _prettify_grouping_label
 from ..utils.constants import (
     GROUPINGS, OUTPUT_DIR, TZ, IDENTITY_COLS, ATTEMPT_COLS, INCLUDE_BY_GROUPING,
-    SPECIFIC_GROUPINGS, SPECIFIC_COLS, TYPE_COLS
+    SPECIFIC_GROUPINGS, SPECIFIC_COLS, TYPE_COLS,
 )
-from ..utils.audit_helpers import _ensure_parent, _to_native, _normalize_table, _with_ext, audit_table, audit_schema, _safe_name
-import logging
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
-from scipy.optimize import curve_fit
-from scipy.stats import beta as _beta
-from typing import Dict, Any
-import re
+from ..utils.audit_helpers import (
+    _ensure_parent, _to_native, _normalize_table, _with_ext,
+    audit_table, audit_schema, _safe_name,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Column renaming helpers
+# ---------------------------------------------------------------------------
 
 def _rename_rate_cols(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     """Rename standard primary-rate column set with a suffix."""
@@ -30,31 +56,120 @@ def _rename_rate_cols(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
         }
     )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger(__name__)
-# ------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Bayesian learning curve
+# ---------------------------------------------------------------------------
 
 def bayesian_learning_curve(t, fail_rate, decay_rate, decay_exponent, prior_weight):
     """
-    Generalized Bayesian learning curve:
-    Predicts has_loss probability after `t` launches.
-    
-    Parameters:
-    - fail_rate: initial belief of has_loss probability
-    - decay_rate: how quickly learning occurs (λ)
-    - decay_exponent: shape of learning curve (δ)
-    - prior_weight: confidence in prior (pseudo-observations)
-    
-    Returns:
-    - Estimated has_loss probability at each launch number `t`
+    Generalized Bayesian learning curve.
+
+    Predicts has_loss probability after ``t`` launches.
+
+    Parameters
+    ----------
+    fail_rate : float – initial belief of has_loss probability
+    decay_rate : float – how quickly learning occurs (lambda)
+    decay_exponent : float – shape of learning curve (delta)
+    prior_weight : float – confidence in prior (pseudo-observations)
     """
     alpha_prior = prior_weight * fail_rate
     beta_prior = prior_weight * (1 - fail_rate)
     denominator = alpha_prior + beta_prior + (decay_rate * t) ** decay_exponent
     return alpha_prior / denominator
+
+
+def _build_initial_guess_and_bounds():
+    """Return (initial_guess, lower_bounds, upper_bounds) arrays for curve_fit."""
+    initial_guess = np.array([0.1, 1.0, 1.0, 10.0], dtype=float)
+    lower_bounds = np.array([0.001, 0.01, 0.1, 2.0], dtype=float)
+    upper_bounds = np.array([0.999, 100.0, 5.0, 500.0], dtype=float)
+    return initial_guess, lower_bounds, upper_bounds
+
+
+def _compute_fit_diagnostics(t, p, p_hat, params, pcov, lower_bounds, upper_bounds):
+    """Compute residuals, metrics, and parameter uncertainty from a curve fit."""
+    fail_rate, decay_rate, decay_exponent, prior_weight = params
+
+    resid = p - p_hat
+    abs_resid = np.abs(resid)
+    sq_resid = resid ** 2
+    sse = float(np.sum(sq_resid))
+    mae = float(np.mean(abs_resid))
+    rmse = float(np.sqrt(np.mean(sq_resid)))
+    p_mean = float(np.mean(p))
+    sst = float(np.sum((p - p_mean) ** 2))
+    r2 = float(1.0 - sse / sst) if sst > 0 else np.nan
+
+    # Parameter standard errors from covariance matrix
+    se = np.full(4, np.nan, dtype=float)
+    if isinstance(pcov, np.ndarray) and pcov.shape == (4, 4):
+        diag = np.diag(pcov)
+        se = np.where(np.isfinite(diag) & (diag >= 0.0), np.sqrt(diag), np.nan)
+
+    ci95 = 1.96 * se
+    param_names = ["fail_rate", "decay_rate", "decay_exponent", "prior_weight"]
+    param_values = [fail_rate, decay_rate, decay_exponent, prior_weight]
+
+    params_df = pd.DataFrame({
+        "param": param_names,
+        "value": param_values,
+        "std_error": se,
+        "ci95_low": [v - c if np.isfinite(c) else np.nan for v, c in zip(param_values, ci95)],
+        "ci95_high": [v + c if np.isfinite(c) else np.nan for v, c in zip(param_values, ci95)],
+        "lower_bound": lower_bounds,
+        "upper_bound": upper_bounds,
+        "within_bounds": [(lower_bounds[i] <= params[i] <= upper_bounds[i]) for i in range(4)],
+    })
+
+    emp_vs_fit = pd.DataFrame({
+        "t": t, "p_empirical": p, "p_hat": p_hat,
+        "residual": resid, "abs_residual": abs_resid, "sq_residual": sq_resid,
+    })
+
+    metrics = pd.DataFrame([{
+        "n_points": int(t.size), "rmse": rmse, "mae": mae, "r2": r2,
+        "sse": sse, "sst": sst, "mean_p": p_mean,
+        "covariance_finite": bool(np.isfinite(se).any()),
+    }])
+
+    # Covariance matrix
+    if isinstance(pcov, np.ndarray) and pcov.shape == (4, 4):
+        cov_df = pd.DataFrame(pcov, index=param_names, columns=param_names)
+    else:
+        cov_df = pd.DataFrame(columns=param_names)
+
+    return params_df, emp_vs_fit, metrics, cov_df
+
+
+def _audit_learning_curve(audit_path, attempt_column, empirical_data, initial_guess,
+                          lower_bounds, upper_bounds, params_df, alpha, beta,
+                          prior_weight, fail_rate, emp_vs_fit, metrics,
+                          t_fit, p_fit, cov_df, audit_context):
+    """Write all learning-curve audit tables under ``audit_path/learning_curve/``."""
+    base = audit_path / "learning_curve"
+    audit_table(True, base / "00_empirical_data", empirical_data, head=None)
+    igb = pd.DataFrame({
+        "param": ["fail_rate", "decay_rate", "decay_exponent", "prior_weight"],
+        "initial_guess": initial_guess, "lower_bound": lower_bounds, "upper_bound": upper_bounds,
+    })
+    audit_table(True, base / "01_initial_guess_bounds", igb, head=None)
+    audit_table(True, base / "02_fit_params", params_df, head=None)
+    audit_table(True, base / "03_prior_alpha_beta",
+                pd.DataFrame([{"alpha": alpha, "beta": beta,
+                               "prior_weight": prior_weight, "fail_rate": fail_rate}]),
+                head=None)
+
+    emp_vs_fit_out = emp_vs_fit.rename(columns={"t": attempt_column})
+    audit_table(True, base / "04_empirical_vs_fitted", emp_vs_fit_out, head=None)
+    audit_table(True, base / "05_fit_metrics", metrics, head=None)
+    audit_table(True, base / "06_tfit_curve",
+                pd.DataFrame({attempt_column: t_fit, "p_fit": p_fit}), head=None)
+    audit_table(True, base / "07_param_covariance", cov_df, head=None)
+    if audit_context:
+        audit_table(True, base / "08_context", pd.DataFrame([audit_context]), head=None)
+
 
 def fit_learning_curve(
     df: pd.DataFrame,
@@ -62,211 +177,79 @@ def fit_learning_curve(
     *,
     audit: bool = False,
     audit_path: Path | None = None,
-    audit_context: dict | None = None,  # optional: e.g. {"grouping_col": "..."}
+    audit_context: dict | None = None,
 ):
     """
-    Fits a Bayesian learning curve to the empirical has_loss probabilities.
+    Fit a Bayesian learning curve to the empirical has_loss probabilities.
 
-    Returns:
-    - t_fit: Launch attempt numbers used for prediction (np.ndarray)
-    - p_fit: Predicted has_loss probabilities on t_fit (np.ndarray)
-    - alpha, beta: Inferred prior parameters (floats)
-    - decay_rate (λ), decay_exponent (δ), prior_weight: fitted params (floats)
-
-    If audit=True and audit_path provided, writes tables under:
-      <audit_path>/learning_curve/
-        00_empirical_data.(csv|xlsx)
-        01_initial_guess_bounds.(csv|xlsx)
-        02_fit_params.(csv|xlsx)
-        03_prior_alpha_beta.(csv|xlsx)
-        04_empirical_vs_fitted.(csv|xlsx)
-        05_fit_metrics.(csv|xlsx)
-        06_tfit_curve.(csv|xlsx)
-        07_param_covariance.(csv|xlsx)
-        08_context.(csv|xlsx)  [only if context provided]
-        99_fit_error.(csv|xlsx) [only if optimization fails]
+    Returns
+    -------
+    t_fit, p_fit : np.ndarray – fitted curve points
+    alpha, beta : float – inferred prior parameters
+    decay_rate, decay_exponent, prior_weight : float – fitted parameters
     """
-    # --- derive empirical points ------------------------------------------------
     empirical_data = compute_empirical_cumulative_has_loss(df, attempt_column)
     t = empirical_data[attempt_column].to_numpy()
     p = empirical_data['Empirical_has_loss_Probability'].to_numpy()
 
     if audit and audit_path is not None:
-        base = audit_path / "learning_curve"
-        audit_table(True, base / "00_empirical_data", empirical_data, head=None)
+        audit_table(True, audit_path / "learning_curve" / "00_empirical_data",
+                    empirical_data, head=None)
 
+    # Degenerate case: no data at attempts >= 3
     if t.size == 0:
-        # degenerate case: no data at attempts >=3
-        t_fit = np.array([], dtype=float)
-        p_fit = np.array([], dtype=float)
-        alpha = beta = np.nan
-        decay_rate = decay_exponent = prior_weight = np.nan
         if audit and audit_path is not None:
-            # record the fact we had no empirical points
-            metrics = pd.DataFrame([{
+            empty_metrics = pd.DataFrame([{
                 "n_points": 0, "rmse": np.nan, "mae": np.nan, "r2": np.nan,
-                "note": "No empirical points (attempt >= 3)"
+                "note": "No empirical points (attempt >= 3)",
             }])
-            audit_table(True, (audit_path / "learning_curve") / "05_fit_metrics", metrics, head=None)
-        return t_fit, p_fit, alpha, beta, decay_rate, decay_exponent, prior_weight
+            audit_table(True, audit_path / "learning_curve" / "05_fit_metrics",
+                        empty_metrics, head=None)
+        return (np.array([], dtype=float), np.array([], dtype=float),
+                np.nan, np.nan, np.nan, np.nan, np.nan)
 
-    # --- initial guess and bounds ----------------------------------------------
-    # [fail_rate, decay_rate (λ), decay_exponent (δ), prior_weight]
-    initial_guess = np.array([0.1, 1.0, 1.0, 10.0], dtype=float)
-    lower_bounds = np.array([0.001, 0.01, 0.1, 2.0], dtype=float)
-    upper_bounds = np.array([0.999, 100.0, 5.0, 500.0], dtype=float)
+    initial_guess, lower_bounds, upper_bounds = _build_initial_guess_and_bounds()
 
-    if audit and audit_path is not None:
-        igb = pd.DataFrame({
-            "param": ["fail_rate", "decay_rate", "decay_exponent", "prior_weight"],
-            "initial_guess": initial_guess,
-            "lower_bound": lower_bounds,
-            "upper_bound": upper_bounds,
-        })
-        audit_table(True, (audit_path / "learning_curve") / "01_initial_guess_bounds", igb, head=None)
-
-    # --- fit --------------------------------------------------------------------
     try:
         params, pcov = curve_fit(
-            bayesian_learning_curve,
-            t, p,
+            bayesian_learning_curve, t, p,
             p0=initial_guess,
             bounds=(lower_bounds, upper_bounds),
             maxfev=10000,
         )
     except Exception as e:
         if audit and audit_path is not None:
-            audit_table(True, (audit_path / "learning_curve") / "99_fit_error",
+            audit_table(True, audit_path / "learning_curve" / "99_fit_error",
                         pd.DataFrame([{"error": str(e)}]), head=None)
         raise
 
     fail_rate, decay_rate, decay_exponent, prior_weight = params
     alpha = float(prior_weight * fail_rate)
-    beta  = float(prior_weight * (1.0 - fail_rate))
+    beta = float(prior_weight * (1.0 - fail_rate))
 
-    # predictions at empirical points (for residuals)
-    p_hat_emp = bayesian_learning_curve(t, fail_rate, decay_rate, decay_exponent, prior_weight)
-
-    # extended grid for plotting
+    p_hat_emp = bayesian_learning_curve(t, *params)
     t_fit = np.arange(3, int(np.max(t)) + 10, dtype=int)
-    p_fit = bayesian_learning_curve(t_fit, fail_rate, decay_rate, decay_exponent, prior_weight)
+    p_fit = bayesian_learning_curve(t_fit, *params)
 
-    # --- diagnostics ------------------------------------------------------------
-    resid = p - p_hat_emp
-    abs_resid = np.abs(resid)
-    sq_resid = resid**2
-    sse = float(np.sum(sq_resid))
-    mae = float(np.mean(abs_resid))
-    rmse = float(np.sqrt(np.mean(sq_resid)))
-    p_mean = float(np.mean(p))
-    sst = float(np.sum((p - p_mean)**2))
-    r2 = float(1.0 - sse / sst) if sst > 0 else np.nan
+    # Diagnostics
+    params_df, emp_vs_fit, metrics, cov_df = _compute_fit_diagnostics(
+        t, p, p_hat_emp, params, pcov, lower_bounds, upper_bounds,
+    )
 
-    # parameter uncertainties (if covariance is sensible)
-    se = np.full(4, np.nan, dtype=float)
-    if isinstance(pcov, np.ndarray) and pcov.shape == (4, 4):
-        diag = np.diag(pcov)
-        # guard against negative/inf diag due to poor conditioning
-        se = np.where(np.isfinite(diag) & (diag >= 0.0), np.sqrt(diag), np.nan)
-
-    ci95 = 1.96 * se
-    params_df = pd.DataFrame({
-        "param": ["fail_rate", "decay_rate", "decay_exponent", "prior_weight"],
-        "value": [fail_rate, decay_rate, decay_exponent, prior_weight],
-        "std_error": se,
-        "ci95_low": [v - c if np.isfinite(c) else np.nan for v, c in zip([fail_rate, decay_rate, decay_exponent, prior_weight], ci95)],
-        "ci95_high": [v + c if np.isfinite(c) else np.nan for v, c in zip([fail_rate, decay_rate, decay_exponent, prior_weight], ci95)],
-        "lower_bound": lower_bounds,
-        "upper_bound": upper_bounds,
-        "within_bounds": [
-            (lower_bounds[i] <= params[i] <= upper_bounds[i]) for i in range(4)
-        ],
-    })
-
-    # empirical vs fitted table
-    emp_vs_fit = pd.DataFrame({
-        attempt_column: t,
-        "p_empirical": p,
-        "p_hat": p_hat_emp,
-        "residual": resid,
-        "abs_residual": abs_resid,
-        "sq_residual": sq_resid,
-    }).sort_values(attempt_column)
-
-    # fit metrics
-    metrics = pd.DataFrame([{
-        "n_points": int(t.size),
-        "rmse": rmse,
-        "mae": mae,
-        "r2": r2,
-        "sse": sse,
-        "sst": sst,
-        "mean_p": p_mean,
-        "covariance_finite": bool(np.isfinite(se).any()),  # at least one finite SE
-    }])
-
-    # covariance matrix (wide)
-    if isinstance(pcov, np.ndarray) and pcov.shape == (4, 4):
-        cov_df = pd.DataFrame(
-            pcov,
-            index=["fail_rate", "decay_rate", "decay_exponent", "prior_weight"],
-            columns=["fail_rate", "decay_rate", "decay_exponent", "prior_weight"],
-        )
-    else:
-        cov_df = pd.DataFrame(columns=["fail_rate", "decay_rate", "decay_exponent", "prior_weight"])
-
-    # --- audit dumps ------------------------------------------------------------
     if audit and audit_path is not None:
-        base = audit_path / "learning_curve"
-        audit_table(True, base / "02_fit_params", params_df, head=None)
-        audit_table(True, base / "03_prior_alpha_beta",
-                    pd.DataFrame([{"alpha": alpha, "beta": beta, "prior_weight": prior_weight, "fail_rate": fail_rate}]),
-                    head=None)
-        audit_table(True, base / "04_empirical_vs_fitted", emp_vs_fit, head=None)
-        audit_table(True, base / "05_fit_metrics", metrics, head=None)
-        audit_table(True, base / "06_tfit_curve",
-                    pd.DataFrame({attempt_column: t_fit, "p_fit": p_fit}), head=None)
-        audit_table(True, base / "07_param_covariance", cov_df, head=None)
-        if audit_context:
-            ctx = pd.DataFrame([audit_context])
-            audit_table(True, base / "08_context", ctx, head=None)
+        _audit_learning_curve(
+            audit_path, attempt_column, empirical_data,
+            initial_guess, lower_bounds, upper_bounds,
+            params_df, alpha, beta, prior_weight, fail_rate,
+            emp_vs_fit, metrics, t_fit, p_fit, cov_df, audit_context,
+        )
 
     return t_fit, p_fit, alpha, beta, decay_rate, decay_exponent, prior_weight
 
 
-def compute_empirical_conditionals(df, attempt_column, grouping_col):
-    """
-    Compute empirical has_loss rates for launches 1 to 3:
-    - p1: unconditional has_loss rate at launch 1
-    - p2_given: conditional has_loss rate at launch 2 given outcome of launch 1
-    - p3_given: conditional has_loss rate at launch 3 given outcome pattern at launch 1 and 2
-    """
-    # Filter for launches after 2000 only
-    # df = df[df['launch_date'] >= '2000-01-01'].copy()
-
-    # Launch 1 has_loss rate
-    p1 = df[df[attempt_column] == 1]['has_loss'].mean()
-
-    # Build pairs for launch 2 conditioning
-    l1 = df[df[attempt_column] == 1][[grouping_col, 'has_loss']]
-    l2 = df[df[attempt_column] == 2][[grouping_col, 'has_loss']]
-    pairs = pd.merge(l1, l2, on=grouping_col, suffixes=('_1', '_2'))
-
-    p2_given = {
-        'F': pairs[pairs['has_loss_1'] == 1]['has_loss_2'].mean(),
-        'S': pairs[pairs['has_loss_1'] == 0]['has_loss_2'].mean()
-    }
-
-    # Build triplets for launch 3 conditioning
-    l3 = df[df[attempt_column] == 3][[grouping_col, 'has_loss']]
-    triples = pd.merge(pairs, l3, on=grouping_col)
-    triples['fail_count'] = triples['has_loss_1'] + triples['has_loss_2']
-    p3_given = {
-        str(int(fail_count)): group['has_loss'].mean()
-        for fail_count, group in triples.groupby('fail_count')
-    }
-
-    return p1, p2_given, p3_given
+# ---------------------------------------------------------------------------
+# Empirical conditional probabilities (p1, p2|y1, p3|y1,y2)
+# ---------------------------------------------------------------------------
 
 def compute_empirical_conditionals(
     df: pd.DataFrame,
@@ -277,172 +260,144 @@ def compute_empirical_conditionals(
     audit_path: Path | None = None,
 ):
     """
-    Compute empirical has_loss rates for launches 1 to 3:
-    - p1: unconditional has_loss rate at launch 1
-    - p2_given: conditional has_loss rate at launch 2 given outcome of launch 1
-    - p3_given: conditional has_loss rate at launch 3 given outcome pattern at launch 1 and 2
+    Compute empirical has_loss rates for launches 1 to 3.
 
-    If audit=True and audit_path is provided, writes the following tables:
-      empirical/00_coverage.(csv|xlsx)
-      empirical/01_l1.(csv|xlsx)
-      empirical/02_l2.(csv|xlsx)
-      empirical/03_pairs_l1_l2.(csv|xlsx)
-      empirical/04_l3.(csv|xlsx)
-      empirical/05_triples.(csv|xlsx)
-      empirical/06_p1_summary.(csv|xlsx)
-      empirical/07_p2_summary.(csv|xlsx)
-      empirical/08_p3_summary.(csv|xlsx)
-      empirical/09_reported_conditionals.(csv|xlsx)
-
-    Depends on the audit helper: audit_table(...)
+    Returns
+    -------
+    p1 : float – unconditional has_loss rate at launch 1
+    p2_given : dict – conditional rate at launch 2 given launch 1 outcome
+    p3_given : dict – conditional rate at launch 3 given prior fail count
     """
-    # --- core computation (unchanged logic) ---------------------------------
-    # Launch 1 has_loss rate
     p1 = df[df[attempt_column] == 1]['has_loss'].mean()
 
-    # Build pairs for launch 2 conditioning
-    l1 = df[df[attempt_column] == 1][[grouping_col, 'has_loss']].rename(columns={'has_loss': 'has_loss_1'})
-    l2 = df[df[attempt_column] == 2][[grouping_col, 'has_loss']].rename(columns={'has_loss': 'has_loss_2'})
+    # Pairs for launch 2 conditioning
+    l1 = df[df[attempt_column] == 1][[grouping_col, 'has_loss']].rename(
+        columns={'has_loss': 'has_loss_1'})
+    l2 = df[df[attempt_column] == 2][[grouping_col, 'has_loss']].rename(
+        columns={'has_loss': 'has_loss_2'})
     pairs = pd.merge(l1, l2, on=grouping_col, how="inner")
 
     p2_given = {
         'F': pairs[pairs['has_loss_1'] == 1]['has_loss_2'].mean(),
-        'S': pairs[pairs['has_loss_1'] == 0]['has_loss_2'].mean()
+        'S': pairs[pairs['has_loss_1'] == 0]['has_loss_2'].mean(),
     }
 
-    # Build triplets for launch 3 conditioning
-    l3 = df[df[attempt_column] == 3][[grouping_col, 'has_loss']].rename(columns={'has_loss': 'has_loss_3'})
+    # Triplets for launch 3 conditioning
+    l3 = df[df[attempt_column] == 3][[grouping_col, 'has_loss']].rename(
+        columns={'has_loss': 'has_loss_3'})
     triples = pd.merge(pairs, l3, on=grouping_col, how="inner")
     triples['fail_count'] = triples['has_loss_1'] + triples['has_loss_2']
     p3_given = {
-        str(int(fail_count)): group['has_loss_3'].mean()
-        for fail_count, group in triples.groupby('fail_count')
+        str(int(fc)): grp['has_loss_3'].mean()
+        for fc, grp in triples.groupby('fail_count')
     }
 
-    # --- optional audit ------------------------------------------------------
     if audit and audit_path is not None:
-        base = audit_path / "empirical"
-
-        # Coverage / matching counts
-        coverage = pd.DataFrame([{
-            "grouping_col": grouping_col,
-            "n_l1_total": int(len(l1)),
-            "n_l2_total": int(len(l2)),
-            "n_pairs_l1_l2": int(len(pairs)),
-            "n_l3_total": int(len(l3)),
-            "n_triples": int(len(triples)),
-        }])
-
-        # p1 summary
-        p1_summary = pd.DataFrame([{
-            "grouping_col": grouping_col,
-            "p1": float(p1),
-            "n_l1": int(len(l1)),
-            "n_l1_fail": int(l1["has_loss_1"].sum()),
-        }])
-
-        # p2 branches
-        def _p2_branch_stats(df_, cond_val):
-            br = df_[df_["has_loss_1"] == cond_val]
-            return pd.Series({
-                "n_pairs": int(len(br)),
-                "n_losses_at_l2": int(br["has_loss_2"].sum()),
-                "p2_mean": float(br["has_loss_2"].mean()) if len(br) else np.nan,
-            })
-
-        p2_fail = _p2_branch_stats(pairs, 1)
-        p2_succ = _p2_branch_stats(pairs, 0)
-        p2_summary = pd.DataFrame([
-            {"grouping_col": grouping_col, "branch": "L1=Fail", **p2_fail.to_dict()},
-            {"grouping_col": grouping_col, "branch": "L1=Success", **p2_succ.to_dict()},
-        ])
-
-        # p3 by fail_count
-        if len(triples):
-            p3_summary = (triples.groupby("fail_count", as_index=False)["has_loss_3"]
-                                 .agg(n_triplets="count",
-                                      n_losses_at_l3="sum",
-                                      p3_mean="mean"))
-            p3_summary.insert(0, "grouping_col", grouping_col)
-            p3_summary["fail_count"] = p3_summary["fail_count"].astype(int)
-        else:
-            p3_summary = pd.DataFrame(columns=["grouping_col","fail_count","n_triplets","n_losses_at_l3","p3_mean"])
-
-        # Final reported values (for easy cross-check)
-        reported = pd.DataFrame([
-            {"metric": "p1", "value": float(p1)},
-            {"metric": "p2_given[L1=Fail]", "value": float(p2_given.get("F", np.nan))},
-            {"metric": "p2_given[L1=Success]", "value": float(p2_given.get("S", np.nan))},
-            {"metric": "p3_given[fail_count=0]", "value": float(p3_given.get("0", np.nan))},
-            {"metric": "p3_given[fail_count=1]", "value": float(p3_given.get("1", np.nan))},
-            {"metric": "p3_given[fail_count=2]", "value": float(p3_given.get("2", np.nan))},
-        ])
-        reported.insert(0, "grouping_col", grouping_col)
-
-        # write tables (full, no head limits)
-        audit_table(True, base / "00_coverage", coverage, head=None)
-        audit_table(True, base / "01_l1", l1, head=None)
-        audit_table(True, base / "02_l2", l2, head=None)
-        audit_table(True, base / "03_pairs_l1_l2", pairs, head=None)
-        audit_table(True, base / "04_l3", l3, head=None)
-        audit_table(True, base / "05_triples", triples, head=None)
-
-        audit_table(True, base / "06_p1_summary", p1_summary, head=None)
-        audit_table(True, base / "07_p2_summary", p2_summary, head=None)
-        audit_table(True, base / "08_p3_summary", p3_summary, head=None)
-        audit_table(True, base / "09_reported_conditionals", reported, head=None)
+        _audit_empirical_conditionals(
+            audit_path, grouping_col, l1, l2, l3, pairs, triples,
+            p1, p2_given, p3_given,
+        )
 
     return p1, p2_given, p3_given
 
+
+def _audit_empirical_conditionals(audit_path, grouping_col, l1, l2, l3,
+                                  pairs, triples, p1, p2_given, p3_given):
+    """Write empirical conditional audit tables."""
+    base = audit_path / "empirical"
+
+    coverage = pd.DataFrame([{
+        "grouping_col": grouping_col,
+        "n_l1_total": int(len(l1)), "n_l2_total": int(len(l2)),
+        "n_pairs_l1_l2": int(len(pairs)),
+        "n_l3_total": int(len(l3)), "n_triples": int(len(triples)),
+    }])
+    audit_table(True, base / "00_coverage", coverage, head=None)
+    audit_table(True, base / "01_l1", l1, head=None)
+    audit_table(True, base / "02_l2", l2, head=None)
+    audit_table(True, base / "03_pairs_l1_l2", pairs, head=None)
+    audit_table(True, base / "04_l3", l3, head=None)
+    audit_table(True, base / "05_triples", triples, head=None)
+
+    p1_summary = pd.DataFrame([{
+        "grouping_col": grouping_col, "p1": float(p1),
+        "n_l1": int(len(l1)), "n_l1_fail": int(l1["has_loss_1"].sum()),
+    }])
+    audit_table(True, base / "06_p1_summary", p1_summary, head=None)
+
+    def _p2_branch(df_, cond_val):
+        br = df_[df_["has_loss_1"] == cond_val]
+        return {
+            "n_pairs": int(len(br)),
+            "n_losses_at_l2": int(br["has_loss_2"].sum()),
+            "p2_mean": float(br["has_loss_2"].mean()) if len(br) else np.nan,
+        }
+
+    p2_summary = pd.DataFrame([
+        {"grouping_col": grouping_col, "branch": "L1=Fail", **_p2_branch(pairs, 1)},
+        {"grouping_col": grouping_col, "branch": "L1=Success", **_p2_branch(pairs, 0)},
+    ])
+    audit_table(True, base / "07_p2_summary", p2_summary, head=None)
+
+    if len(triples):
+        p3_summary = (
+            triples.groupby("fail_count", as_index=False)["has_loss_3"]
+            .agg(n_triplets="count", n_losses_at_l3="sum", p3_mean="mean")
+        )
+        p3_summary.insert(0, "grouping_col", grouping_col)
+        p3_summary["fail_count"] = p3_summary["fail_count"].astype(int)
+    else:
+        p3_summary = pd.DataFrame(
+            columns=["grouping_col", "fail_count", "n_triplets", "n_losses_at_l3", "p3_mean"])
+
+    audit_table(True, base / "08_p3_summary", p3_summary, head=None)
+
+    reported = pd.DataFrame([
+        {"metric": "p1", "value": float(p1)},
+        {"metric": "p2_given[L1=Fail]", "value": float(p2_given.get("F", np.nan))},
+        {"metric": "p2_given[L1=Success]", "value": float(p2_given.get("S", np.nan))},
+        {"metric": "p3_given[fail_count=0]", "value": float(p3_given.get("0", np.nan))},
+        {"metric": "p3_given[fail_count=1]", "value": float(p3_given.get("1", np.nan))},
+        {"metric": "p3_given[fail_count=2]", "value": float(p3_given.get("2", np.nan))},
+    ])
+    reported.insert(0, "grouping_col", grouping_col)
+    audit_table(True, base / "09_reported_conditionals", reported, head=None)
+
+
+# ---------------------------------------------------------------------------
+# Prior helpers
+# ---------------------------------------------------------------------------
+
 def empirical_prior(t, outcome_history, p2_given, p3_given, default_weight=10):
     """
-    Return alpha, beta prior based on empirical estimates for t=1 to 3, or None for t>=4.
-
-    Args:
-        t: Current launch number
-        outcome_history: list of prior outcomes (1 = has_loss, 0 = success)
-        p1, p2_given, p3_given: from compute_empirical_conditionals
-        default_weight: strength of empirical prior
-
-    Returns:
-        (alpha, beta) or None
+    Return (alpha, beta) prior for t=2 or t=3 based on empirical estimates,
+    or None for t >= 4 (use learning curve instead).
     """
-    """ if t == 1:
-        p = p1 """
-    """ el """
     if t == 2 and len(outcome_history) >= 1:
         prev = outcome_history[0]
         p = p2_given['F' if prev == 1 else 'S']
     elif t == 3 and len(outcome_history) >= 2:
-        """ key = ''.join(['F' if o == 1 else 'S' for o in outcome_history[:2]]) """
         key = sum(outcome_history)
-        p = p3_given[str(key)]  # fallback to neutral prior if unseen pattern
+        p = p3_given[str(key)]
     else:
-        return None  # use learning curve from here
+        return None
 
     alpha = default_weight * p
     beta = default_weight * (1 - p)
     return alpha, beta
 
-def has_loss_prior(t, alpha0, beta0, lambda_, delta):
-     
-    return alpha0 / (alpha0 + beta0 + (lambda_ * (t+8)) ** delta)
 
 def has_loss_prior(t, alpha0, beta0, lambda_, delta):
+    """Compute the prior has_loss probability at launch ``t``."""
     t = max(1, t)
     return alpha0 / (alpha0 + beta0 + (lambda_ * (t - 1)) ** delta)
 
+
 def apply_exponential_decay(outcomes, current_launch, decay_tau):
     """
-    Applies an exponential decay to the weights of outcomes based on their age.
+    Apply exponential decay to outcome weights based on their age.
 
-    Parameters:
-    outcomes (list): A list of binary outcomes (1 for has_loss, 0 for success).
-    current_launch (int): The current launch number.
-    decay_tau (float): The decay constant for the exponential function.
-
-    Returns:
-    tuple: A tuple containing the total has_loss weight and success weight.
+    Returns (fail_weight, success_weight).
     """
     fail_weight = 0.0
     succ_weight = 0.0
@@ -460,23 +415,58 @@ def apply_exponential_decay(outcomes, current_launch, decay_tau):
             succ_weight += weight
     return fail_weight, succ_weight
 
+
 def failure_prior(t, alpha0, beta0, lambda_, delta):
+    """Alias for has_loss_prior (kept for backward compatibility)."""
     t = max(1, t)
     return alpha0 / (alpha0 + beta0 + (lambda_ * (t - 1)) ** delta)
 
+
+# ---------------------------------------------------------------------------
+# Beta CI helper
+# ---------------------------------------------------------------------------
+
+def _beta_ci(a: float, b: float, ci: float = 0.95):
+    """Compute mean, lower, upper from Beta(a, b) at given confidence."""
+    total = a + b
+    p_mean = a / total if total > 0 else np.nan
+    if a > 0 and b > 0:
+        p_lower = _beta.ppf((1 - ci) / 2, a, b)
+        p_upper = _beta.ppf(1 - (1 - ci) / 2, a, b)
+    else:
+        p_lower = np.nan
+        p_upper = np.nan
+    return float(p_mean), float(p_lower), float(p_upper)
+
+
+# ---------------------------------------------------------------------------
+# _LaunchBayesPredictor – shared Bayesian prediction machinery
+# ---------------------------------------------------------------------------
+
 class _LaunchBayesPredictor:
     """
-    Shared machinery for:
-      • curve shape g(t), step factor s_t, early-weight w_early(t),
-      • empirical priors for t=1,2,3 (using p1, p2_given, p3_given),
-      • buckets for early / late / base / curve,
-      • advancing across gaps with the curve nudge,
-      • composing prior counts at a given t.
+    Core Bayesian prediction engine for launch failure probability.
+
+    Manages:
+    - Curve shape g(t), step factor s_t, early-weight w_early(t)
+    - Empirical priors for t=1,2,3
+    - Observation buckets (early / late / base / curve)
+    - Gap advancement via curve nudge
+    - Prior composition at a given t
     """
 
-    def __init__(self, lam: float, delt: float, default_weight: float,
-                 p1_global: float, p2_given: Dict[str, float], p3_given: Dict[str, float],
-                 *, audit: bool = False, audit_events: list | None = None) -> None:
+    def __init__(
+        self,
+        lam: float,
+        delt: float,
+        default_weight: float,
+        p1_global: float,
+        p2_given: Dict[str, float],
+        p3_given: Dict[str, float],
+        *,
+        audit: bool = False,
+        audit_events: list | None = None,
+    ) -> None:
         self.lam = float(lam)
         self.delt = float(delt)
         self.w0 = float(default_weight)
@@ -484,24 +474,30 @@ class _LaunchBayesPredictor:
         self.p2_given = p2_given
         self.p3_given = p3_given
         self.audit = bool(audit)
-        self._events = audit_events if audit_events is not None else ( [] if audit else None )
+        self._events = audit_events if audit_events is not None else ([] if audit else None)
         self._seq = 0
 
-    # ---------- small logger ----------
+    # --- Audit logger ---
+
     def _log(self, **kv):
         if not self.audit or self._events is None:
             return
         self._seq += 1
         row = {"seq": self._seq}
-        row.update({k: (float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v)
-                    for k, v in kv.items()})
+        row.update({
+            k: (float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v)
+            for k, v in kv.items()
+        })
         self._events.append(row)
 
-    # ---------- curve & schedules ----------
+    # --- Curve shape & schedules ---
+
     def g(self, t: int) -> float:
+        """Learning curve shape function."""
         return 1.0 / (1.0 + (self.lam * max(t - 1, 0)) ** self.delt)
 
     def step_factor(self, t: int) -> float:
+        """Ratio g(t)/g(t-1) clamped to [0, 1]."""
         if t <= 1:
             return 1.0
         gt = self.g(t)
@@ -509,7 +505,7 @@ class _LaunchBayesPredictor:
         return float(max(0.0, min(1.0, gt / max(gtm1, 1e-12))))
 
     def w_early(self, t: int) -> float:
-        # 1.0 through t=40, 0.0 by t=60, with curve-shaped fade.
+        """Early-launch weight: 1.0 through t=40, fades to 0.0 by t=60."""
         if t <= 40:
             return 1.0
         if t >= 60:
@@ -520,7 +516,8 @@ class _LaunchBayesPredictor:
             return (60.0 - float(t)) / 20.0  # linear fallback
         return float(max(0.0, min(1.0, (self.g(t) - g60) / denom)))
 
-    # ---------- empirical priors t=1,2,3 ----------
+    # --- Empirical priors for t=1,2,3 ---
+
     def prior_empirical_t1(self) -> tuple[float, float]:
         p = self.p1
         a, b = self.w0 * p, self.w0 * (1 - p)
@@ -541,6 +538,7 @@ class _LaunchBayesPredictor:
         return a, b
 
     def empirical_p3_anchor(self, launches: np.ndarray, outcomes: np.ndarray) -> float:
+        """Compute the empirical p3 anchor probability given observed launches 1-2."""
         has_t1 = (launches == 1).any()
         has_t2 = (launches == 2).any()
         if has_t1 and has_t2:
@@ -550,9 +548,11 @@ class _LaunchBayesPredictor:
             first = int(outcomes[launches == 1][0])
             p2 = float(self.p2_given["F" if first == 1 else "S"])
             if first == 1:
-                return (1 - p2) * float(self.p3_given.get("1", self.p1)) + p2 * float(self.p3_given.get("2", self.p1))
+                return ((1 - p2) * float(self.p3_given.get("1", self.p1))
+                        + p2 * float(self.p3_given.get("2", self.p1)))
             else:
-                return (1 - p2) * float(self.p3_given.get("0", self.p1)) + p2 * float(self.p3_given.get("1", self.p1))
+                return ((1 - p2) * float(self.p3_given.get("0", self.p1))
+                        + p2 * float(self.p3_given.get("1", self.p1)))
         return float(self.p1)
 
     def prior_empirical_t3(self, launches: np.ndarray, outcomes: np.ndarray) -> tuple[float, float]:
@@ -561,14 +561,21 @@ class _LaunchBayesPredictor:
         self._log(action="empirical_prior_t3", p=p, a=a, b=b)
         return a, b
 
-    # ---------- buckets & advancing ----------
+    # --- Observation buckets ---
+
     @staticmethod
     def _init_buckets() -> Dict[str, float]:
-        # early (t<=20), late (t>=21), base anchor at t=3, curve virtual successes (b only)
-        return dict(a_early=0.0, b_early=0.0, a_late=0.0, b_late=0.0, a_base=0.0, b_base=0.0, b_curve=0.0)
+        """Initialize observation buckets: early (t<=20), late (t>20), base anchor, curve."""
+        return dict(
+            a_early=0.0, b_early=0.0,
+            a_late=0.0, b_late=0.0,
+            a_base=0.0, b_base=0.0,
+            b_curve=0.0,
+        )
 
     @staticmethod
     def _posterior_update(buckets: Dict[str, float], t_obs: int, y: int) -> None:
+        """Update buckets with an observation at t_obs."""
         if t_obs <= 20:
             buckets["a_early"] += y
             buckets["b_early"] += (1 - y)
@@ -577,13 +584,14 @@ class _LaunchBayesPredictor:
             buckets["b_late"] += (1 - y)
 
     def _compose_prior_counts(self, buckets: Dict[str, float], t: int) -> tuple[float, float]:
+        """Compose alpha/beta from all buckets, applying early-weight fade."""
         w = self.w_early(t)
         a = w * buckets["a_early"] + buckets["a_late"] + buckets["a_base"]
         b = w * buckets["b_early"] + buckets["b_late"] + buckets["b_base"] + buckets["b_curve"]
         return a, b
 
     def _curve_nudge_once(self, buckets: Dict[str, float], t: int) -> None:
-        # Add ONLY virtual successes so that mean decreases by step factor.
+        """Add virtual successes so the mean decreases by the step factor."""
         a_raw, b_raw = self._compose_prior_counts(buckets, t)
         tot = a_raw + b_raw
         if tot <= 0:
@@ -592,19 +600,20 @@ class _LaunchBayesPredictor:
         mu_prev = a_raw / tot
         s_t = self.step_factor(t)
         mu_target = min(mu_prev, mu_prev * s_t)
-        # delta_b = a*(1/mu_target - 1) - b
         delta_b = a_raw * (1.0 / max(mu_target, 1e-12) - 1.0) - b_raw
         if delta_b > 1e-12:
             buckets["b_curve"] += delta_b
         a_new, b_new = self._compose_prior_counts(buckets, t)
-        self._log(action="advance_curve", t=t, w_early=self.w_early(t),
-                  g=self.g(t), step_factor=s_t, mu_prev=mu_prev, mu_target=mu_target,
-                  delta_b=max(delta_b, 0.0), a=a_new, b=b_new)
+        self._log(
+            action="advance_curve", t=t, w_early=self.w_early(t),
+            g=self.g(t), step_factor=s_t, mu_prev=mu_prev, mu_target=mu_target,
+            delta_b=max(delta_b, 0.0), a=a_new, b=b_new,
+        )
 
     def advance_to(self, buckets: Dict[str, float], last_t: int, target_t: int) -> int:
         """
-        Apply the curve-improvement step for each integer t in (last_t, target_t], starting at t>=4.
-        No observations are added here.
+        Apply curve-improvement step for each t in (last_t, target_t], starting at t >= 4.
+        No observations are added.
         """
         start = max(last_t + 1, 4)
         if target_t >= start:
@@ -613,10 +622,25 @@ class _LaunchBayesPredictor:
             return target_t
         return last_t
 
-from typing import Any, Dict
-from pathlib import Path
-import numpy as np
-import pandas as pd
+    # --- Anchor setup ---
+
+    def ensure_anchor(self, buckets: Dict[str, float], launches: np.ndarray,
+                      outcomes: np.ndarray, default_weight: float,
+                      base_set: bool) -> tuple[bool, int]:
+        """Set the t=3 anchor if not already set. Returns (base_set, last_t)."""
+        if base_set:
+            return True, 3
+        p3 = self.empirical_p3_anchor(launches, outcomes)
+        buckets["a_base"] = default_weight * p3
+        buckets["b_base"] = default_weight * (1 - p3)
+        self._log(action="set_anchor_t3", t=3, p_anchor=p3,
+                  a_base=buckets["a_base"], b_base=buckets["b_base"])
+        return True, 3
+
+
+# ---------------------------------------------------------------------------
+# Full-history predictions (all observed launches)
+# ---------------------------------------------------------------------------
 
 def predict_has_loss_probabilities_all_launches_with_empirical(
     df: pd.DataFrame,
@@ -624,11 +648,11 @@ def predict_has_loss_probabilities_all_launches_with_empirical(
     delta_set: Dict[int, float],
     p2_given: Dict[str, float],
     p3_given: Dict[str, float],
-    alpha0_set: Dict[int, float],  # unused (kept for signature compatibility)
-    beta0_set: Dict[int, float],   # unused (kept for signature compatibility)
+    alpha0_set: Dict[int, float],
+    beta0_set: Dict[int, float],
     default_weight: float = 10,
     ci: float = 0.95,
-    decay_tau: float = 10,  # unused
+    decay_tau: float = 10,
     grouping_col: str = "vehicle_type",
     attempt_column: str = "lv_family_attempt_number",
     *,
@@ -636,14 +660,10 @@ def predict_has_loss_probabilities_all_launches_with_empirical(
     audit_path: Path | None = None,
 ) -> pd.DataFrame:
     """
-    For each observed launch t_obs, record the PRIOR@t_obs computed as:
-      • t=1..3: purely empirical (p1, p2|y1, p3|y1,y2).
-      • t>=4: take the running POSTERIOR@(t_obs-1) (which started at PRIOR@3 anchor,
-              only updated with t>=3 outcomes), advance via curve from (t_obs-1) to t_obs,
-              then compose PRIOR@t_obs.
+    For each observed launch, compute the PRIOR at that launch number.
 
-    After recording PRIOR@t_obs, we POSTERIOR-update with the observed y_t_obs and
-    carry that forward. This matches “posterior from previous launch × learning-curve delta”.
+    - t=1..3: purely empirical priors.
+    - t>=4: running posterior from t=3 anchor, advanced via learning curve.
     """
     required = {grouping_col, attempt_column, "has_loss", "launch_date", "seradata_spacecraft_id"}
     missing = required - set(df.columns)
@@ -661,31 +681,28 @@ def predict_has_loss_probabilities_all_launches_with_empirical(
 
     for vehicle in df[grouping_col].dropna().unique():
         sub = (df.loc[df[grouping_col] == vehicle]
-                 .sort_values([attempt_column, "launch_date"], na_position="last"))
+               .sort_values([attempt_column, "launch_date"], na_position="last"))
         if sub.empty:
             continue
 
         launches = sub[attempt_column].to_numpy().astype(int)
         outcomes = sub["has_loss"].to_numpy().astype(int)
-        dates    = sub["launch_date"].to_numpy()
-        sc_ids   = sub["seradata_spacecraft_id"].to_numpy()
+        dates = sub["launch_date"].to_numpy()
+        sc_ids = sub["seradata_spacecraft_id"].to_numpy()
 
-        # running empirical stats (just for reporting)
+        vdir = (base_dir / _safe_name(str(vehicle))) if base_dir is not None else None
+        evts: list[Dict[str, Any]] = []
+        pred = _LaunchBayesPredictor(
+            lam, delt, default_weight, float(p1_global), p2_given, p3_given,
+            audit=audit, audit_events=evts,
+        )
+
+        buckets = pred._init_buckets()
+        base_set = False
+        last_t = 0
         cum_launches = 0
         cum_failures = 0
 
-        # predictor with audit
-        vdir = (base_dir / _safe_name(str(vehicle))) if base_dir is not None else None
-        evts: list[Dict[str, Any]] = []
-        pred = _LaunchBayesPredictor(lam, delt, default_weight, float(p1_global), p2_given, p3_given,
-                                     audit=audit, audit_events=evts)
-
-        # buckets/state for t>=3
-        buckets = pred._init_buckets()
-        base_set = False
-        last_t = 0  # last t reached by curve (or 3 after anchoring)
-
-        # put sequence into audit file
         if audit and vdir is not None:
             seq = pd.DataFrame({"attempt": launches, "has_loss": outcomes, "launch_date": dates})
             audit_table(True, vdir / "01_sequence", seq, head=None)
@@ -693,98 +710,100 @@ def predict_has_loss_probabilities_all_launches_with_empirical(
         for i, t_obs in enumerate(launches):
             t_obs = int(t_obs)
 
-            # ----- PRIOR @ t_obs -----
-            if t_obs == 1:
-                a_prior, b_prior = pred.prior_empirical_t1()
-                if audit: pred._log(action="prior_at_t", t=1, a=a_prior, b=b_prior,
-                                    p=a_prior/(a_prior+b_prior))
-            elif t_obs == 2:
-                a_prior, b_prior = pred.prior_empirical_t2(launches, outcomes)
-                if audit: pred._log(action="prior_at_t", t=2, a=a_prior, b=b_prior,
-                                    p=a_prior/(a_prior+b_prior))
-            elif t_obs == 3:
-                # anchor PRIOR@3
-                if not base_set:
-                    p3 = pred.empirical_p3_anchor(launches, outcomes)
-                    buckets["a_base"] = default_weight * p3
-                    buckets["b_base"] = default_weight * (1 - p3)
-                    base_set = True
-                    if audit: pred._log(action="set_anchor_t3", t=3, p_anchor=p3,
-                                        a_base=buckets["a_base"], b_base=buckets["b_base"])
-                    last_t = 3
-                # no curve before 4 → PRIOR@3 = composed base (+ any prior t>=3 obs; none yet)
-                a_prior, b_prior = pred._compose_prior_counts(buckets, 3)
-                if audit: pred._log(action="prior_at_t", t=3, a=a_prior, b=b_prior,
-                                    p=a_prior/(a_prior+b_prior) if (a_prior+b_prior)>0 else np.nan)
-            else:
-                # ensure anchor exists
-                if not base_set:
-                    p3 = pred.empirical_p3_anchor(launches, outcomes)
-                    buckets["a_base"] = default_weight * p3
-                    buckets["b_base"] = default_weight * (1 - p3)
-                    base_set = True
-                    if audit: pred._log(action="set_anchor_t3", t=3, p_anchor=p3,
-                                        a_base=buckets["a_base"], b_base=buckets["b_base"])
-                    last_t = 3
+            # Compute PRIOR at t_obs
+            a_prior, b_prior = _compute_prior_at_t(
+                pred, t_obs, launches, outcomes, buckets,
+                base_set, last_t, default_weight, audit,
+            )
+            if t_obs >= 3 and not base_set:
+                base_set = True
+                last_t = 3
+            if t_obs >= 4:
+                last_t = t_obs
 
-                # --- NEW: advance POSTERIOR@(last_t) → PRIOR@t_obs (curve step happens here)
-                last_t = pred.advance_to(buckets, last_t, t_obs)
+            p_mean, p_lower, p_upper = _beta_ci(a_prior, b_prior, ci)
 
-                # --- NEW: log PRIOR@t right after the advance, before observe
-                a_prior, b_prior = pred._compose_prior_counts(buckets, t_obs)
-                if audit: pred._log(action="prior_at_t", t=t_obs, a=a_prior, b=b_prior,
-                                    p=a_prior/(a_prior+b_prior) if (a_prior+b_prior)>0 else np.nan)
-
-            # PRIOR metrics
-            p_mean  = a_prior / (a_prior + b_prior) if (a_prior + b_prior) > 0 else np.nan
-            if a_prior > 0 and b_prior > 0:
-                p_lower = _beta.ppf((1 - ci) / 2, a_prior, b_prior)
-                p_upper = _beta.ppf(1 - (1 - ci) / 2, a_prior, b_prior)
-            else:
-                p_lower = np.nan
-                p_upper = np.nan
-
-            # running empirical
             outcome_i = int(outcomes[i])
             cum_launches += 1
             cum_failures += outcome_i
-            cumulative_rate = cum_failures / cum_launches
 
             rows.append({
                 grouping_col: vehicle,
                 "launch_number": int(t_obs),
                 "launch_date": dates[i],
                 "observed_has_loss": outcome_i,
-                "cumulative_rate": float(cumulative_rate),
-                "predicted": float(p_mean),   # PRIOR at t_obs, i.e., (posterior from t-1) advanced by curve
+                "cumulative_rate": float(cum_failures / cum_launches),
+                "predicted": float(p_mean),
                 "ci_lower": float(p_lower),
                 "ci_upper": float(p_upper),
                 "spacecraft_id": sc_ids[i],
             })
 
-            # ----- POSTERIOR update (carry forward) -----
+            # Posterior update (only t >= 3 to avoid double-counting)
             if t_obs >= 3:
-                prev_a, prev_b = a_prior, b_prior  # already composed at t_obs
                 pred._posterior_update(buckets, t_obs, outcome_i)
-                post_a, post_b = pred._compose_prior_counts(buckets, t_obs)
-                if audit: pred._log(action="observe", t=t_obs, y=outcome_i,
-                                    a_before=prev_a, b_before=prev_b,
-                                    a_after=post_a, b_after=post_b,
-                                    p_after=post_a/(post_a+post_b) if (post_a+post_b)>0 else np.nan)
+                if audit:
+                    post_a, post_b = pred._compose_prior_counts(buckets, t_obs)
+                    pred._log(
+                        action="observe", t=t_obs, y=outcome_i,
+                        a_before=a_prior, b_before=b_prior,
+                        a_after=post_a, b_after=post_b,
+                        p_after=post_a / (post_a + post_b) if (post_a + post_b) > 0 else np.nan,
+                    )
                 last_t = t_obs
-            # t=1,2 NOT added to buckets (avoid double-counting)
 
-            # t=1,2 observations are intentionally NOT added to buckets (avoid double-counting)
-
-        # write per-vehicle audit
         if audit and vdir is not None:
-            evtdf = pd.DataFrame(evts) if len(evts) else pd.DataFrame()
+            evtdf = pd.DataFrame(evts) if evts else pd.DataFrame()
             if "seq" in evtdf.columns:
-                evtdf = evtdf.sort_values(["seq"])
+                evtdf = evtdf.sort_values("seq")
             audit_table(True, vdir / "02_event_log", evtdf, head=None)
 
     return pd.DataFrame(rows)
 
+
+def _compute_prior_at_t(pred, t_obs, launches, outcomes, buckets,
+                        base_set, last_t, default_weight, audit):
+    """
+    Compute (a_prior, b_prior) at the given launch number.
+
+    For t=1,2,3: purely empirical. For t>=4: composed from buckets after curve advance.
+    """
+    if t_obs == 1:
+        a, b = pred.prior_empirical_t1()
+    elif t_obs == 2:
+        a, b = pred.prior_empirical_t2(launches, outcomes)
+    elif t_obs == 3:
+        if not base_set:
+            p3 = pred.empirical_p3_anchor(launches, outcomes)
+            buckets["a_base"] = default_weight * p3
+            buckets["b_base"] = default_weight * (1 - p3)
+            if audit:
+                pred._log(action="set_anchor_t3", t=3, p_anchor=p3,
+                          a_base=buckets["a_base"], b_base=buckets["b_base"])
+        a, b = pred._compose_prior_counts(buckets, 3)
+    else:
+        # t >= 4: ensure anchor exists, advance curve, compose
+        if not base_set:
+            p3 = pred.empirical_p3_anchor(launches, outcomes)
+            buckets["a_base"] = default_weight * p3
+            buckets["b_base"] = default_weight * (1 - p3)
+            if audit:
+                pred._log(action="set_anchor_t3", t=3, p_anchor=p3,
+                          a_base=buckets["a_base"], b_base=buckets["b_base"])
+        effective_last = max(last_t, 3) if base_set else 3
+        pred.advance_to(buckets, effective_last, t_obs)
+        a, b = pred._compose_prior_counts(buckets, t_obs)
+
+    if audit:
+        total = a + b
+        pred._log(action="prior_at_t", t=t_obs, a=a, b=b,
+                  p=a / total if total > 0 else np.nan)
+    return a, b
+
+
+# ---------------------------------------------------------------------------
+# Next-launch prediction per vehicle
+# ---------------------------------------------------------------------------
 
 def predict_next_failure_probability_per_vehicle(
     df: pd.DataFrame,
@@ -792,11 +811,11 @@ def predict_next_failure_probability_per_vehicle(
     delta_set: Dict[int, float],
     p2_given: Dict[str, float],
     p3_given: Dict[str, float],
-    alpha0_set: Dict[int, float],  # unused (kept for signature compatibility)
-    beta0_set: Dict[int, float],   # unused (kept for signature compatibility)
+    alpha0_set: Dict[int, float],
+    beta0_set: Dict[int, float],
     default_weight: float = 10,
     ci: float = 0.95,
-    decay_tau: float = 10,  # unused
+    decay_tau: float = 10,
     grouping_col: str = "vehicle_type",
     attempt_column: str = "lv_family_attempt_number",
     *,
@@ -804,10 +823,10 @@ def predict_next_failure_probability_per_vehicle(
     audit_path: Path | None = None,
 ) -> pd.DataFrame:
     """
-    One-step-ahead per vehicle:
-      • next∈{1,2,3}: purely empirical.
-      • next≥4: PRIOR@3 = empirical anchor; update with y3 if present (ONLY t≥3);
-                then advance via curve to 'next' and read PRIOR@next.
+    One-step-ahead prediction per vehicle.
+
+    - next in {1,2,3}: purely empirical.
+    - next >= 4: anchor at t=3, update with t>=3 observations, advance via curve.
     """
     required = {grouping_col, attempt_column, "has_loss", "launch_date"}
     missing = required - set(df.columns)
@@ -824,98 +843,35 @@ def predict_next_failure_probability_per_vehicle(
     base_dir = (audit_path / "next_failure") if (audit and audit_path is not None) else None
 
     for vehicle in df[grouping_col].dropna().unique():
-        sub = df[df[grouping_col] == vehicle].sort_values([attempt_column, "launch_date"], na_position="last")
+        sub = df[df[grouping_col] == vehicle].sort_values(
+            [attempt_column, "launch_date"], na_position="last")
         if sub.empty:
             continue
 
         launches = sub[attempt_column].to_numpy().astype(int)
         outcomes = sub["has_loss"].to_numpy().astype(int)
-        dates    = sub["launch_date"].to_numpy()
+        dates = sub["launch_date"].to_numpy()
         next_launch = (int(launches.max()) + 1) if len(launches) else 1
 
-        # per-vehicle audit
         vdir = (base_dir / _safe_name(str(vehicle))) if base_dir is not None else None
         evts: list[Dict[str, Any]] = []
-        pred = _LaunchBayesPredictor(lam, delt, default_weight, float(p1_global), p2_given, p3_given,
-                                     audit=audit, audit_events=evts)
+        pred = _LaunchBayesPredictor(
+            lam, delt, default_weight, float(p1_global), p2_given, p3_given,
+            audit=audit, audit_events=evts,
+        )
 
         if audit and vdir is not None:
-            meta = pd.DataFrame([{
-                "vehicle": vehicle, "grouping_col": grouping_col, "p1_global": float(p1_global),
-                "lambda": lam, "delta": delt, "default_weight": float(default_weight),
-                "ci": float(ci), "next_launch": int(next_launch),
-                "n_obs": int(len(launches)), "total_failures": int(np.nansum(outcomes)),
-                "p2_given_F": float(p2_given.get("F", np.nan)),
-                "p2_given_S": float(p2_given.get("S", np.nan)),
-                "p3_given_0": float(p3_given.get("0", np.nan)),
-                "p3_given_1": float(p3_given.get("1", np.nan)),
-                "p3_given_2": float(p3_given.get("2", np.nan)),
-            }])
-            audit_table(True, vdir / "00_metadata", meta, head=None)
-            seq = pd.DataFrame({"attempt": launches, "has_loss": outcomes, "launch_date": dates})
-            audit_table(True, vdir / "01_sequence", seq, head=None)
+            _audit_next_failure_metadata(
+                vdir, vehicle, grouping_col, p1_global, lam, delt,
+                default_weight, ci, next_launch, launches, outcomes,
+                dates, p2_given, p3_given,
+            )
 
-        if next_launch == 1:
-            a_next, b_next = pred.prior_empirical_t1()
-            if audit: pred._log(
-                action="prediction_next_launch_1", t=1, a=a_next, 
-                b=b_next, p=a_next/(a_next+b_next) if (a_next+b_next)>0 else np.nan
-                )
-        elif next_launch == 2:
-            a_next, b_next = pred.prior_empirical_t2(launches, outcomes)
-            if audit: pred._log(action="prediction_next_launch_2", t=2, a=a_next, b=b_next, p=a_next/(a_next+b_next) if (a_next+b_next)>0 else np.nan)
-        elif next_launch == 3:
-            a_next, b_next = pred.prior_empirical_t3(launches, outcomes)
-            if audit: pred._log(action="prediction_next_launch_3", t=3, a=a_next, b=b_next, p=a_next/(a_next+b_next) if (a_next+b_next)>0 else np.nan)
-        else:
-            # Anchor at t=3
-            buckets = pred._init_buckets()
-            p3 = pred.empirical_p3_anchor(launches, outcomes)
-            buckets["a_base"] = default_weight * p3
-            buckets["b_base"] = default_weight * (1 - p3)
-            if audit:
-                pred._log(action="set_anchor_t3", t=3, p_anchor=p3,
-                        a=buckets["a_base"], b=buckets["b_base"])
-            last_t = 3
+        a_next, b_next = _predict_next_for_vehicle(
+            pred, next_launch, launches, outcomes, default_weight, audit,
+        )
 
-            # Include ONLY t≥3 observations — correct order: advance FIRST, then observe
-            for i, t_obs in enumerate(launches):
-                t_obs = int(t_obs)
-                if t_obs >= 3:
-                    # 1) move posterior@(last_t) -> PRIOR@t_obs via curve
-                    last_t = pred.advance_to(buckets, last_t, t_obs)
-
-                    # (optional logging of PRIOR@t_obs)
-                    if audit:
-                        a_prior, b_prior = pred._compose_prior_counts(buckets, t_obs)
-                        pred._log(action="prior_at_t", t=t_obs,
-                                a=a_prior, b=b_prior,
-                                p=a_prior/(a_prior+b_prior) if (a_prior+b_prior)>0 else np.nan)
-
-                    # 2) observe y_t to form POSTERIOR@t_obs
-                    prev_a, prev_b = pred._compose_prior_counts(buckets, t_obs)
-                    pred._posterior_update(buckets, t_obs, int(outcomes[i]))
-                    post_a, post_b = pred._compose_prior_counts(buckets, t_obs)
-                    if audit:
-                        pred._log(action="observe", t=t_obs, y=int(outcomes[i]),
-                                a_before=prev_a, b_before=prev_b,
-                                a_after=post_a, b_after=post_b,
-                                p_after=post_a/(post_a+post_b) if (post_a+post_b)>0 else np.nan)
-
-                    last_t = t_obs  # keep in sync
-                    # (no curve at this same t again)
-
-            # Finally: advance POSTERIOR@last_t -> PRIOR@next
-            last_t = pred.advance_to(buckets, last_t, int(next_launch))
-            a_next, b_next = pred._compose_prior_counts(buckets, int(next_launch))
-            if audit:
-                pred._log(action="compose_prior_at_next", t=int(next_launch), a=a_next, b=b_next,
-                        p=a_next/(a_next+b_next) if (a_next+b_next)>0 else np.nan)
-
-
-        p_mean  = a_next / (a_next + b_next) if (a_next + b_next) > 0 else np.nan
-        p_lower = _beta.ppf((1 - ci) / 2, a_next, b_next) if (a_next > 0 and b_next > 0) else np.nan
-        p_upper = _beta.ppf(1 - (1 - ci) / 2, a_next, b_next) if (a_next > 0 and b_next > 0) else np.nan
+        p_mean, p_lower, p_upper = _beta_ci(a_next, b_next, ci)
 
         results.append({
             grouping_col: vehicle,
@@ -928,12 +884,13 @@ def predict_next_failure_probability_per_vehicle(
         })
 
         if audit and vdir is not None:
-            evtdf = pd.DataFrame(evts) if len(evts) else pd.DataFrame()
+            evtdf = pd.DataFrame(evts) if evts else pd.DataFrame()
             if "seq" in evtdf.columns:
-                evtdf = evtdf.sort_values(["seq"])
+                evtdf = evtdf.sort_values("seq")
             audit_table(True, vdir / "02_event_log", evtdf, head=None)
             prior_next = pd.DataFrame([{
-                "next_launch": int(next_launch), "a_next": float(a_next), "b_next": float(b_next),
+                "next_launch": int(next_launch),
+                "a_next": float(a_next), "b_next": float(b_next),
                 "p_mean": float(p_mean), "ci_lower": float(p_lower), "ci_upper": float(p_upper),
             }])
             audit_table(True, vdir / "03_prior_next", prior_next, head=None)
@@ -941,31 +898,111 @@ def predict_next_failure_probability_per_vehicle(
     return pd.DataFrame(results)
 
 
+def _predict_next_for_vehicle(pred, next_launch, launches, outcomes, default_weight, audit):
+    """Compute (a_next, b_next) for the next launch of a single vehicle."""
+    if next_launch == 1:
+        a, b = pred.prior_empirical_t1()
+        if audit:
+            pred._log(action="prediction_next_launch_1", t=1, a=a, b=b,
+                      p=a / (a + b) if (a + b) > 0 else np.nan)
+        return a, b
 
+    if next_launch == 2:
+        a, b = pred.prior_empirical_t2(launches, outcomes)
+        if audit:
+            pred._log(action="prediction_next_launch_2", t=2, a=a, b=b,
+                      p=a / (a + b) if (a + b) > 0 else np.nan)
+        return a, b
+
+    if next_launch == 3:
+        a, b = pred.prior_empirical_t3(launches, outcomes)
+        if audit:
+            pred._log(action="prediction_next_launch_3", t=3, a=a, b=b,
+                      p=a / (a + b) if (a + b) > 0 else np.nan)
+        return a, b
+
+    # next_launch >= 4: anchor at t=3, observe t>=3, advance to next
+    buckets = pred._init_buckets()
+    p3 = pred.empirical_p3_anchor(launches, outcomes)
+    buckets["a_base"] = default_weight * p3
+    buckets["b_base"] = default_weight * (1 - p3)
+    if audit:
+        pred._log(action="set_anchor_t3", t=3, p_anchor=p3,
+                  a=buckets["a_base"], b=buckets["b_base"])
+    last_t = 3
+
+    # Replay observations at t >= 3
+    for i, t_obs in enumerate(launches):
+        t_obs = int(t_obs)
+        if t_obs < 3:
+            continue
+        last_t = pred.advance_to(buckets, last_t, t_obs)
+
+        if audit:
+            a_prior, b_prior = pred._compose_prior_counts(buckets, t_obs)
+            pred._log(action="prior_at_t", t=t_obs, a=a_prior, b=b_prior,
+                      p=a_prior / (a_prior + b_prior) if (a_prior + b_prior) > 0 else np.nan)
+
+        prev_a, prev_b = pred._compose_prior_counts(buckets, t_obs)
+        pred._posterior_update(buckets, t_obs, int(outcomes[i]))
+        if audit:
+            post_a, post_b = pred._compose_prior_counts(buckets, t_obs)
+            pred._log(
+                action="observe", t=t_obs, y=int(outcomes[i]),
+                a_before=prev_a, b_before=prev_b,
+                a_after=post_a, b_after=post_b,
+                p_after=post_a / (post_a + post_b) if (post_a + post_b) > 0 else np.nan,
+            )
+        last_t = t_obs
+
+    # Advance posterior to next launch
+    last_t = pred.advance_to(buckets, last_t, int(next_launch))
+    a_next, b_next = pred._compose_prior_counts(buckets, int(next_launch))
+    if audit:
+        pred._log(action="compose_prior_at_next", t=int(next_launch), a=a_next, b=b_next,
+                  p=a_next / (a_next + b_next) if (a_next + b_next) > 0 else np.nan)
+    return a_next, b_next
+
+
+def _audit_next_failure_metadata(vdir, vehicle, grouping_col, p1_global, lam, delt,
+                                 default_weight, ci, next_launch, launches, outcomes,
+                                 dates, p2_given, p3_given):
+    """Write metadata and sequence audit files for a vehicle."""
+    meta = pd.DataFrame([{
+        "vehicle": vehicle, "grouping_col": grouping_col, "p1_global": float(p1_global),
+        "lambda": lam, "delta": delt, "default_weight": float(default_weight),
+        "ci": float(ci), "next_launch": int(next_launch),
+        "n_obs": int(len(launches)), "total_failures": int(np.nansum(outcomes)),
+        "p2_given_F": float(p2_given.get("F", np.nan)),
+        "p2_given_S": float(p2_given.get("S", np.nan)),
+        "p3_given_0": float(p3_given.get("0", np.nan)),
+        "p3_given_1": float(p3_given.get("1", np.nan)),
+        "p3_given_2": float(p3_given.get("2", np.nan)),
+    }])
+    audit_table(True, vdir / "00_metadata", meta, head=None)
+    seq = pd.DataFrame({"attempt": launches, "has_loss": outcomes, "launch_date": dates})
+    audit_table(True, vdir / "01_sequence", seq, head=None)
+
+
+# ---------------------------------------------------------------------------
+# Dropdown / rate loading helpers
+# ---------------------------------------------------------------------------
 
 def create_dropdown_options(df: pd.DataFrame, grouping_col: str) -> pd.DataFrame:
-    """
-    Create dropdown options for a given grouping column.
-    Returns a DataFrame with columns [grouping_col, value].
-    """
+    """Create dropdown options for a given grouping column."""
     if grouping_col not in df.columns:
         raise KeyError(f"Column '{grouping_col}' not found in DataFrame.")
-
     pretty_name = _prettify_grouping_label(grouping_col)
-
     unique_values = df[grouping_col].dropna().unique()
     values = sorted(map(str, unique_values))
-    options = [{"grouping_col": pretty_name, "value": v} for v in values]
-    return pd.DataFrame(options)
-
-
+    return pd.DataFrame([{"grouping_col": pretty_name, "value": v} for v in values])
 
 
 def load_specific_primary_rates_long(output_dir: Path, date_tag: str) -> pd.DataFrame:
     """
-    Build one long table with columns:
-    ['grouping_col','value', *_specific]
-    by concatenating the five per-grouping primary-rate files.
+    Build one long table from per-grouping primary-rate files.
+
+    Columns: ['grouping_col', 'value', *SPECIFIC_COLS]
     """
     frames: list[pd.DataFrame] = []
     for grouping_label, (file_key, id_col) in SPECIFIC_GROUPINGS.items():
@@ -980,37 +1017,32 @@ def load_specific_primary_rates_long(output_dir: Path, date_tag: str) -> pd.Data
         tmp = _rename_rate_cols(tmp, "_specific")
         tmp = (
             tmp.rename(columns={id_col: "value"})
-               .assign(grouping_col=grouping_label)
-               [ ["grouping_col", "value"] + SPECIFIC_COLS ]
+            .assign(grouping_col=grouping_label)
+            [["grouping_col", "value"] + SPECIFIC_COLS]
         )
         frames.append(tmp)
 
     if frames:
         return pd.concat(frames, ignore_index=True)
-    # Empty but with schema, so downstream merge is stable
     return pd.DataFrame(columns=["grouping_col", "value"] + SPECIFIC_COLS)
 
 
 def load_type_primary_rates(output_dir: Path, date_tag: str) -> pd.DataFrame:
-    """
-    Load the vehicle_type primary rates and suffix columns with _type.
-    Returns columns: ['vehicle_type', *_type]
-    """
+    """Load vehicle_type primary rates and suffix columns with _type."""
     path = output_dir / f"launch_primary_rates_vehicle_type_{date_tag}_next.csv"
     if not path.exists():
         logger.warning("Type rates file not found: %s", path)
         return pd.DataFrame(columns=["vehicle_type"] + TYPE_COLS)
-
     df = pd.read_csv(path)
     if "vehicle_type" not in df.columns:
-        logger.warning("Expected 'vehicle_type' column missing in %s; continuing with empty.", path)
+        logger.warning("Expected 'vehicle_type' column missing in %s", path)
         return pd.DataFrame(columns=["vehicle_type"] + TYPE_COLS)
-
     df = _rename_rate_cols(df, "_type")
-    return df[ ["vehicle_type"] + TYPE_COLS ]
+    return df[["vehicle_type"] + TYPE_COLS]
+
 
 def coerce_dropdown_schema(df: pd.DataFrame) -> pd.DataFrame:
-    # columns we expect by type
+    """Ensure dropdown DataFrame has consistent column types."""
     INT_COLS = [
         "lv_type_attempt_number", "lv_family_attempt_number", "lv_provider_attempt_number",
         "lv_variant_attempt_number", "lv_minor_variant_attempt_number",
@@ -1026,12 +1058,10 @@ def coerce_dropdown_schema(df: pd.DataFrame) -> pd.DataFrame:
         "vehicle_type", "vehicle_variant", "vehicle_minor_variant",
     ]
 
-    # ensure all columns exist so casting is stable
     for c in INT_COLS + FLOAT_COLS + STR_COLS:
         if c not in df.columns:
             df[c] = pd.NA
 
-    # cast/fill
     for c in INT_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
     for c in FLOAT_COLS:
@@ -1042,174 +1072,182 @@ def coerce_dropdown_schema(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# --- MAIN ------------------------------------------------------------------
-def main(audit_outputs: bool = False) -> None:
-    # Create a stable, timezone-aware date tag for filenames
-    date_tag = datetime.now(tz=TZ).strftime("%Y%m%d")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    AUDIT_DIR = OUTPUT_DIR / f"audit_{date_tag}"
-    if audit_outputs:
-        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Pipeline steps (called by main)
+# ---------------------------------------------------------------------------
 
-    logger.info("Loading and preparing data...")
-    launch_df = load_and_prepare_data(filter_min_year_on=False)
-    
-    print(
-        launch_df.loc[
-            launch_df["vehicle_type"].str.casefold().eq("ZHUQUE-2/SUZAKU-2 (ZQ-2)"),
-            ["vehicle_type", "type_launches_since_last_failure"]
-        ]
+def _process_grouping(launch_df, grouping_col, date_tag, audit_outputs, audit_dir):
+    """
+    Process a single grouping level: fit learning curve, predict rates,
+    build dropdown rows, and export CSV/JSON files.
+
+    Returns the dropdown DataFrame for this grouping.
+    """
+    grp_dir = (audit_dir / grouping_col) if audit_outputs else None
+    logger.info("=== Processing grouping: %s ===", grouping_col)
+
+    # 1) Select columns for this grouping
+    clean_launch_data, attempt_column, selected_columns = select_grouping_columns(
+        launch_df, grouping_col,
     )
-    
-    all_dropdown_rows: list[pd.DataFrame] = []
 
-    for grouping_col in GROUPINGS:
-        grp_dir = (AUDIT_DIR / grouping_col) if audit_outputs else None
-        # 1) Extract data for modeling/prediction
-        logger.info("=== Processing grouping: %s ===", grouping_col)
-        clean_launch_data, attempt_column, selected_columns = select_grouping_columns(
-            launch_df, grouping_col
-        )
+    # 2) Empirical conditionals
+    p1, p2_given, p3_given = compute_empirical_conditionals(
+        launch_df, attempt_column=attempt_column, grouping_col=grouping_col,
+        audit=audit_outputs, audit_path=grp_dir,
+    )
+    logger.info("Empirical conditionals for %s: p1=%f, p2_given=%s, p3_given=%s",
+                grouping_col, p1, p2_given, p3_given)
 
-        # 2) Empirical conditionals
-        first_launch_fr, second_launch_fr, third_launch_fr = compute_empirical_conditionals(
-            launch_df,
-            attempt_column=attempt_column,
-            grouping_col=grouping_col,
-            audit=audit_outputs,
-            audit_path=grp_dir,
-        )
-
-        logger.info(
-            "Empirical conditionals for %s: p1=%f, p2_given=%s, p3_given=%s",
-            grouping_col, first_launch_fr, second_launch_fr, third_launch_fr
-        )
-
-        # 3) Fit the learning curve (if >=3 attempts)
-        logger.info("Fitting learning curve (All losses) for %s...", grouping_col)
-        if (clean_launch_data[attempt_column] >= 3).any():
-            _t_fit, _p_fit, alpha_all, beta_all, lambda_all, delta_all, _prior_w = fit_learning_curve(
-                clean_launch_data,
-                attempt_column,
-                audit=audit_outputs,
-                audit_path=grp_dir,
-                audit_context={"grouping_col": grouping_col, "attempt_column": attempt_column},
-            )
-        else:
-            logger.warning("Not enough attempts (>=3) in %s to fit learning curve; using NaNs.", grouping_col)
-            alpha_all = np.nan
-            beta_all = np.nan
-            lambda_all = np.nan
-            delta_all = np.nan
-
-        # Use "All" param set for buckets
-        alpha0_set = {0: alpha_all, 1: alpha_all, 2: alpha_all}
-        beta0_set  = {0: beta_all,  1: beta_all,  2: beta_all}
-        lambda_set = {0: lambda_all, 1: lambda_all, 2: lambda_all}
-        delta_set  = {0: delta_all,  1: delta_all,  2: delta_all}
-
-        primary_rates = predict_next_failure_probability_per_vehicle(
-            df=clean_launch_data,
-            alpha0_set=alpha0_set, beta0_set=beta0_set,
-            lambda_set=lambda_set, delta_set=delta_set,
-            p2_given=second_launch_fr, p3_given=third_launch_fr,
-            ci=0.95, grouping_col=grouping_col, attempt_column=attempt_column,
+    # 3) Fit the learning curve
+    logger.info("Fitting learning curve for %s...", grouping_col)
+    if (clean_launch_data[attempt_column] >= 3).any():
+        _t_fit, _p_fit, alpha_all, beta_all, lambda_all, delta_all, _prior_w = fit_learning_curve(
+            clean_launch_data, attempt_column,
             audit=audit_outputs, audit_path=grp_dir,
+            audit_context={"grouping_col": grouping_col, "attempt_column": attempt_column},
         )
+    else:
+        logger.warning("Not enough attempts (>=3) in %s; using NaNs.", grouping_col)
+        alpha_all = beta_all = lambda_all = delta_all = np.nan
 
-        full_history_df = predict_has_loss_probabilities_all_launches_with_empirical(
-            clean_launch_data,
-            lambda_set=lambda_set, delta_set=delta_set,
-            p2_given=second_launch_fr, p3_given=third_launch_fr,
-            alpha0_set=alpha0_set, beta0_set=beta0_set,
-            grouping_col=grouping_col, attempt_column=attempt_column,
-            audit=True, audit_path=grp_dir,
-        )
+    # Use a single param set for all buckets
+    param_set = {0: alpha_all, 1: alpha_all, 2: alpha_all}
+    alpha0_set = param_set
+    beta0_set = {0: beta_all, 1: beta_all, 2: beta_all}
+    lambda_set = {0: lambda_all, 1: lambda_all, 2: lambda_all}
+    delta_set = {0: delta_all, 1: delta_all, 2: delta_all}
 
-        # full dropdown columns for grouping
-        dropdown_rows_df = build_dropdown_rows_for_grouping(launch_df, grouping_col)
-        all_dropdown_rows.append(dropdown_rows_df)
+    # 4) Predict next-launch failure rate per vehicle
+    primary_rates = predict_next_failure_probability_per_vehicle(
+        df=clean_launch_data,
+        alpha0_set=alpha0_set, beta0_set=beta0_set,
+        lambda_set=lambda_set, delta_set=delta_set,
+        p2_given=p2_given, p3_given=p3_given,
+        ci=0.95, grouping_col=grouping_col, attempt_column=attempt_column,
+        audit=audit_outputs, audit_path=grp_dir,
+    )
 
-        # --- per-grouping exports (unchanged) ---
-        prefix = f"launch_primary_rates_{grouping_col}_{date_tag}"
-        next_launch_path = OUTPUT_DIR / f"{prefix}_next.csv"
-        full_history_path = OUTPUT_DIR / f"{prefix}_full.csv"
+    # 5) Full history predictions
+    full_history_df = predict_has_loss_probabilities_all_launches_with_empirical(
+        clean_launch_data,
+        lambda_set=lambda_set, delta_set=delta_set,
+        p2_given=p2_given, p3_given=p3_given,
+        alpha0_set=alpha0_set, beta0_set=beta0_set,
+        grouping_col=grouping_col, attempt_column=attempt_column,
+        audit=True, audit_path=grp_dir,
+    )
 
-        primary_rates.to_csv(next_launch_path, index=False)
-        full_history_df.to_csv(full_history_path, index=False)
+    # 6) Build dropdown rows
+    dropdown_rows_df = build_dropdown_rows_for_grouping(launch_df, grouping_col)
 
-        next_launch_json_path = next_launch_path.with_suffix(".json")
-        full_history_json_path = full_history_path.with_suffix(".json")
+    # 7) Export per-grouping CSV + JSON
+    _export_grouping_outputs(primary_rates, full_history_df, grouping_col, date_tag)
 
-        primary_rates.to_json(next_launch_json_path, orient="records", indent=2)
-        full_history_df.to_json(full_history_json_path, orient="records", indent=2)
+    return dropdown_rows_df
 
-        logger.info(
-            "Saved CSVs & JSONs for %s:\n- %s\n- %s\n- %s\n- %s",
-            grouping_col,
-            next_launch_path,
-            full_history_path,
-            next_launch_json_path,
-            full_history_json_path,
-        )
 
-    # --- Unified dropdown export (CSV + JSON) -------------------------------
+def _export_grouping_outputs(primary_rates, full_history_df, grouping_col, date_tag):
+    """Export next-launch and full-history DataFrames as CSV and JSON."""
+    prefix = f"launch_primary_rates_{grouping_col}_{date_tag}"
+    next_path = OUTPUT_DIR / f"{prefix}_next.csv"
+    full_path = OUTPUT_DIR / f"{prefix}_full.csv"
+
+    primary_rates.to_csv(next_path, index=False)
+    full_history_df.to_csv(full_path, index=False)
+    primary_rates.to_json(next_path.with_suffix(".json"), orient="records", indent=2)
+    full_history_df.to_json(full_path.with_suffix(".json"), orient="records", indent=2)
+
+    logger.info("Saved CSVs & JSONs for %s:\n- %s\n- %s\n- %s\n- %s",
+                grouping_col, next_path, full_path,
+                next_path.with_suffix(".json"), full_path.with_suffix(".json"))
+
+
+def _build_unified_dropdown(all_dropdown_rows, date_tag):
+    """Merge dropdown rows with primary rates and export unified dropdown CSV/JSON."""
     if all_dropdown_rows:
         all_dropdowns_df = pd.concat(all_dropdown_rows, ignore_index=True)
-        # Deduplicate for stability (some groups may alias the same label/value)
         all_dropdowns_df = (
             all_dropdowns_df.drop_duplicates()
             .sort_values(["grouping_col", "value"], kind="mergesort")
             .reset_index(drop=True)
         )
     else:
-        # Include all possible columns so CSV schema is predictable
-        all_cols = ["grouping_col", "value"] + list({c for v in INCLUDE_BY_GROUPING.values() for c in v}) + ATTEMPT_COLS + ["total_failures"]
+        all_cols = (
+            ["grouping_col", "value"]
+            + list({c for v in INCLUDE_BY_GROUPING.values() for c in v})
+            + ATTEMPT_COLS + ["total_failures"]
+        )
         all_dropdowns_df = pd.DataFrame(columns=all_cols)
 
-        # ---- Attach primary rates: _specific (by grouping/value) and _type (by vehicle_type)
-    specific_rates_long = load_specific_primary_rates_long(OUTPUT_DIR, date_tag)
+    # Attach specific rates (by grouping/value)
+    specific_rates = load_specific_primary_rates_long(OUTPUT_DIR, date_tag)
     all_dropdowns_df = all_dropdowns_df.merge(
-        specific_rates_long,
-        on=["grouping_col", "value"],
-        how="left",
-        validate="m:1",
+        specific_rates, on=["grouping_col", "value"], how="left", validate="m:1",
     )
 
+    # Attach type rates (by vehicle_type)
     type_rates = load_type_primary_rates(OUTPUT_DIR, date_tag)
-    # Merge on vehicle_type for everyone, regardless of grouping
     all_dropdowns_df = all_dropdowns_df.merge(
-        type_rates,
-        on="vehicle_type",
-        how="left",
-        validate="m:1",
+        type_rates, on="vehicle_type", how="left", validate="m:1",
     )
 
-        # After merges:
     all_dropdowns_df = coerce_dropdown_schema(all_dropdowns_df)
 
-    unified_path_csv = OUTPUT_DIR / f"launch_dropdown_options_all_{date_tag}.csv"
-    all_dropdowns_df.to_csv(unified_path_csv, index=False)
+    # Export
+    csv_path = OUTPUT_DIR / f"launch_dropdown_options_all_{date_tag}.csv"
+    all_dropdowns_df.to_csv(csv_path, index=False)
+    all_dropdowns_df.to_json(csv_path.with_suffix(".json"), orient="records", indent=2)
+    logger.info("Saved unified dropdown options:\n- %s\n- %s",
+                csv_path, csv_path.with_suffix(".json"))
 
-    unified_path_json = unified_path_csv.with_suffix(".json")
-    all_dropdowns_df.to_json(unified_path_json, orient="records", indent=2)
 
-    logger.info("Saved unified dropdown options CSV & JSON:\n- %s\n- %s", unified_path_csv, unified_path_json)
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
-# def main(audit_outputs: bool = False) -> None:
-#     # Create a stable, timezone-aware date tag for filenames
-#     date_tag = datetime.now(tz=TZ).strftime("%Y%m%d")
-#     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-#     AUDIT_DIR = OUTPUT_DIR / f"audit_{date_tag}"
-#     if audit_outputs:
-#         AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+def main(audit_outputs: bool = False) -> None:
+    """
+    Run the primary base rates production pipeline.
 
-#     logger.info("Loading and preparing data...")
-#     launch_df = load_and_prepare_data(filter_min_year_on=False)
+    Steps:
+    1. Load and prepare launch data
+    2. For each grouping level: fit learning curve, predict rates, export
+    3. Build and export unified dropdown table
+    """
+    date_tag = datetime.now(tz=TZ).strftime("%Y%m%d")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    audit_dir = OUTPUT_DIR / f"audit_{date_tag}"
+    if audit_outputs:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading and preparing data...")
+    launch_df = load_and_prepare_data(filter_min_year_on=False)
+
+    # Debug log for verification
+    print(
+        launch_df.loc[
+            launch_df["vehicle_type"].str.casefold().eq("ZHUQUE-2/SUZAKU-2 (ZQ-2)"),
+            ["vehicle_type", "type_launches_since_last_failure"],
+        ]
+    )
+
+    # Process each grouping level
+    all_dropdown_rows: list[pd.DataFrame] = []
+    for grouping_col in GROUPINGS:
+        dropdown_df = _process_grouping(
+            launch_df, grouping_col, date_tag, audit_outputs, audit_dir,
+        )
+        all_dropdown_rows.append(dropdown_df)
+
+    # Build unified dropdown table
+    _build_unified_dropdown(all_dropdown_rows, date_tag)
+
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--audit-outputs", action="store_true", help="Write intermediate audit artifacts")
+    parser.add_argument("--audit-outputs", action="store_true",
+                        help="Write intermediate audit artifacts")
     args = parser.parse_args()
     main(audit_outputs=args.audit_outputs)
