@@ -1,23 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Fit a survival model to determine fallback base rates and export tables.
+Fallback base rates production pipeline.
 
-This script is the production counterpart to exploratory notebooks: it focuses on
-data processing and exporting tabular outputs (no charts).
+Fits survival-model-based fallback rates at each hierarchy level, computes
+iteration and launches-since-failure modifiers, and exports tabular outputs
+(CSV + JSON).
 """
 from __future__ import annotations
 
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from pathlib import Path
 import logging
-import pandas as pd
+from datetime import datetime
+from pathlib import Path
 
-from ..utils.output_to_csv import output_df_to_csv
+import pandas as pd
+from zoneinfo import ZoneInfo
+
 from ..utils.fit_fallback_base_rate import fit_rates_model
+from ..utils.output_to_csv import output_df_to_csv
 from ..utils.provider_rating_comparison_table import provider_rating_comparison_table
 from .data_load_feature_creation import load_and_prepare_data
-
 
 # -------------------- Configuration --------------------
 TZ = ZoneInfo("Europe/London")
@@ -28,112 +29,183 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
-# ------------------------------------------------------
 
-def _fit_base_for_level(df: pd.DataFrame, attempt_col: str, level_name: str) -> pd.DataFrame:
-    """
-    Fit base rates for a specific level by telling fit_rates_model which attempt column to use.
-    Returns columns: ['attempt_number', level_name, f'empirical_{level_name}'] (if provided by model).
-    """
-    if attempt_col not in df.columns:
-        logging.warning("Attempt column '%s' missing; returning empty for level '%s'", attempt_col, level_name)
-        return pd.DataFrame(columns=["attempt_number", level_name, f"empirical_{level_name}"])
+# -------------------- Levels config --------------------
+# (level_name, attempt_col, bin_col, grouped_col)
+BASE_RATE_LEVELS = [
+    ("type", "lv_type_attempt_number"),
+    ("family", "lv_family_attempt_number"),
+    ("provider", "lv_provider_attempt_number"),
+    ("variant", "lv_variant_attempt_number"),
+    ("minor_variant", "lv_minor_variant_attempt_number"),
+]
 
-    # Tell the model exactly which attempt column to use and how to label outputs
-    grp = [("ignored", attempt_col, level_name)]
-    fitted = _safe_fit_rates_model(df, context=f"{level_name}_base", groupings=grp)
-    if fitted.empty:
-        return fitted
+ITERATION_LEVELS = [
+    ("type", "lv_type_attempt_number", "type_iteration_grouped"),
+    ("variant", "lv_variant_attempt_number", "variant_iteration_grouped"),
+    ("minor_variant", "lv_minor_variant_attempt_number", "minor_variant_iteration_grouped"),
+]
 
-    # Keep the minimal, self-describing columns if present
-    cols = ["attempt_number", level_name, f"empirical_{level_name}"]
-    present = [c for c in cols if c in fitted.columns]
-    return fitted[present] if present else fitted
+LSF_LEVELS = [
+    ("type", "lv_type_attempt_number", "type_SinceFail_Bin"),
+    ("family", "lv_family_attempt_number", "family_SinceFail_Bin"),
+    ("variant", "lv_variant_attempt_number", "variant_SinceFail_Bin"),
+    ("minor_variant", "lv_minor_variant_attempt_number", "minor_variant_SinceFail_Bin"),
+]
 
+LSF_BINS = [("Clean", "clean"), ("1–3", "1_3"), (">=4", "ge4")]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _safe_fit_rates_model(df: pd.DataFrame, context: str, **kwargs) -> pd.DataFrame:
+    """Wrapper around fit_rates_model that handles empty input gracefully."""
     if df.empty:
         logger.warning("Slice '%s' is empty; returning empty DataFrame.", context)
         return pd.DataFrame()
     return fit_rates_model(df, **kwargs)
 
 
+def _make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure DataFrame has unique column names by adding .1, .2, ... suffixes."""
+    counts: dict[str, int] = {}
+    new_cols = []
+    for c in df.columns:
+        if c not in counts:
+            counts[c] = 0
+            new_cols.append(c)
+        else:
+            counts[c] += 1
+            new_cols.append(f"{c}.{counts[c]}")
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
+def _fit_single_level(df: pd.DataFrame, attempt_col: str, label: str,
+                      context: str, max_attempt: int = 20) -> pd.DataFrame:
+    """
+    Fit rates for a single slice. Returns columns:
+    ['attempt_number', label, f'empirical_{label}'] when available.
+    """
+    if attempt_col not in df.columns:
+        logger.warning("Attempt column '%s' missing; returning empty for '%s'.", attempt_col, label)
+        return pd.DataFrame(columns=["attempt_number", label, f"empirical_{label}"])
+
+    grp = [("ignored", attempt_col, label)]
+    fitted = _safe_fit_rates_model(df, context=context, groupings=grp, max_attempt=max_attempt)
+    if fitted.empty:
+        return fitted
+
+    cols = ["attempt_number", label, f"empirical_{label}"]
+    present = [c for c in cols if c in fitted.columns]
+    return fitted[present] if present else fitted
+
+
+def _rename_fitted_columns(df: pd.DataFrame, label: str, suffix: str) -> pd.DataFrame:
+    """Rename fitted columns: label -> label_suffix, empirical_label -> empirical_label_suffix."""
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "attempt_number", f"{label}_{suffix}", f"empirical_{label}_{suffix}",
+        ])
+    return df.rename(columns={
+        label: f"{label}_{suffix}",
+        f"empirical_{label}": f"empirical_{label}_{suffix}",
+    })
+
+
+def _export_csv_json(df: pd.DataFrame, base_path: Path) -> None:
+    """Export a DataFrame as both CSV and JSON."""
+    export_df = _make_unique_columns(df)
+    export_df.to_csv(base_path, index=False)
+    export_df.to_json(base_path.with_suffix(".json"), orient="records", indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Base rates
+# ---------------------------------------------------------------------------
+
+def _fit_base_for_level(df: pd.DataFrame, attempt_col: str, level_name: str) -> pd.DataFrame:
+    """Fit base rates for a specific hierarchy level."""
+    return _fit_single_level(df, attempt_col, level_name,
+                             context=f"{level_name}_base")
+
+
 def _base_rates(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """
-    Fit fallback base rates for type, family, variant, and minor_variant.
-    Returns a dict keyed by level name.
-    """
-    logger.info("Fitting fallback base rates model for all levels…")
+    """Fit fallback base rates for all hierarchy levels."""
+    logger.info("Fitting fallback base rates for all levels...")
     outputs = {
-        "type": _fit_base_for_level(df, "lv_type_attempt_number", "type"),
-        "family": _fit_base_for_level(df, "lv_family_attempt_number", "family"),
-        "provider": _fit_base_for_level(df, "lv_provider_attempt_number", "provider"),
-        "variant": _fit_base_for_level(df, "lv_variant_attempt_number", "variant"),
-        "minor_variant": _fit_base_for_level(df, "lv_minor_variant_attempt_number", "minor_variant"),
+        name: _fit_base_for_level(df, attempt_col, name)
+        for name, attempt_col in BASE_RATE_LEVELS
     }
     for k, v in outputs.items():
         logger.info("Level '%s' produced %d rows", k, len(v))
     return outputs
 
 
+# ---------------------------------------------------------------------------
+# Modifier 1: Iteration (first vs second+)
+# ---------------------------------------------------------------------------
+
 def _modifier_iteration_for_level(
     df: pd.DataFrame,
     attempt_col: str,
     grouped_col: str,
-    label: str,   # <- this becomes the output column name; e.g. "variant"
+    label: str,
     max_attempt: int = 20,
 ) -> pd.DataFrame:
     """
-    Fits Modifier 1 (iteration) for a given level using 'first' vs 'second+' slices.
-    Produces columns: attempt_number, <label>_first, empirical_<label>_first,
-                                and <label>_second_plus, empirical_<label>_second_plus
+    Fit iteration modifier for a level using 'first' vs 'second+' slices.
+
+    Output columns: attempt_number, {label}_first, empirical_{label}_first,
+                    {label}_second_plus, empirical_{label}_second_plus
     """
     if grouped_col not in df.columns:
         raise KeyError(f"Expected column '{grouped_col}' not found for level '{label}'.")
     if attempt_col not in df.columns:
-        logger.warning("Attempt column '%s' missing for level '%s'; returning empty.", attempt_col, label)
-        cols = ["attempt_number",
-                f"{label}_first", f"empirical_{label}_first",
-                f"{label}_second_plus", f"empirical_{label}_second_plus"]
-        return pd.DataFrame(columns=cols)
+        logger.warning("Attempt column '%s' missing for '%s'; returning empty.", attempt_col, label)
+        return pd.DataFrame(columns=[
+            "attempt_number",
+            f"{label}_first", f"empirical_{label}_first",
+            f"{label}_second_plus", f"empirical_{label}_second_plus",
+        ])
 
-    logger.info("Fitting Modifier 1 – %s iteration…", label)
+    logger.info("Fitting Modifier 1 – %s iteration...", label)
 
     first_slice = df[df[grouped_col] == "first"]
     second_plus_slice = df[(df[grouped_col].notna()) & (df[grouped_col] != "first")]
 
-    # Tell the model exactly which attempt column to use, and what to call the output.
     grp = [("ignored", attempt_col, label)]
+    keep_cols = ["attempt_number", label, f"empirical_{label}"]
 
+    # Fit first slice
     mod_first = _safe_fit_rates_model(
         first_slice, context=f"{label}_iteration_first",
-        groupings=grp, max_attempt=max_attempt
+        groupings=grp, max_attempt=max_attempt,
     )
+    mod_first = _rename_fitted_columns(
+        mod_first[keep_cols] if not mod_first.empty else mod_first,
+        label, "first",
+    )
+
+    # Fit second+ slice
     mod_second = _safe_fit_rates_model(
         second_plus_slice, context=f"{label}_iteration_second_plus",
-        groupings=grp, max_attempt=max_attempt
+        groupings=grp, max_attempt=max_attempt,
+    )
+    mod_second = _rename_fitted_columns(
+        mod_second[keep_cols] if not mod_second.empty else mod_second,
+        label, "second_plus",
     )
 
-    # Keep only native columns for this label; no renaming necessary.
-    keep_cols = ["attempt_number", label, f"empirical_{label}"]
-    if not mod_first.empty:
-        mod_first = mod_first[keep_cols].rename(columns={
-            label: f"{label}_first",
-            f"empirical_{label}": f"empirical_{label}_first",
-        })
-    else:
-        mod_first = pd.DataFrame(columns=["attempt_number", f"{label}_first", f"empirical_{label}_first"])
+    return pd.merge(mod_first, mod_second, on="attempt_number", how="outer")
 
-    if not mod_second.empty:
-        mod_second = mod_second[keep_cols].rename(columns={
-            label: f"{label}_second_plus",
-            f"empirical_{label}": f"empirical_{label}_second_plus",
-        })
-    else:
-        mod_second = pd.DataFrame(columns=["attempt_number", f"{label}_second_plus", f"empirical_{label}_second_plus"])
 
-    out = pd.merge(mod_first, mod_second, on="attempt_number", how="outer")
-    return out
+# ---------------------------------------------------------------------------
+# Modifier 2: Launches since last failure (LSF)
+# ---------------------------------------------------------------------------
 
 def _fit_lsf_bin_for_level(
     df: pd.DataFrame,
@@ -143,22 +215,20 @@ def _fit_lsf_bin_for_level(
     label: str,
     max_attempt: int = 20,
 ) -> pd.DataFrame:
-    """
-    Fit fallback base rates for a single SinceFail bin for a given level.
-    Returns columns: ['attempt_number', label, f'empirical_{label}'] when available.
-    """
+    """Fit fallback rates for a single LSF bin for a given level."""
     if bin_col not in df.columns:
         raise KeyError(f"Expected column '{bin_col}' not found for LSF modifier '{label}'.")
     if attempt_col not in df.columns:
         return pd.DataFrame(columns=["attempt_number", label, f"empirical_{label}"])
 
-    # Normalise '1–3' vs '1-3'
+    # Normalise dash variants: '1-3' -> '1–3'
     ser = df[bin_col].astype(object).replace({'1-3': '1–3'})
     slice_df = df.loc[ser == bin_value]
 
     grp = [("ignored", attempt_col, label)]
     fitted = _safe_fit_rates_model(
-        slice_df, context=f"{label}_LSF_{bin_value}", groupings=grp, max_attempt=20
+        slice_df, context=f"{label}_LSF_{bin_value}",
+        groupings=grp, max_attempt=20,
     )
     keep = ["attempt_number", label, f"empirical_{label}"]
     return fitted[keep] if not fitted.empty else pd.DataFrame(columns=keep)
@@ -173,127 +243,129 @@ def _modifier_lsf_for_level(
 ) -> pd.DataFrame:
     """
     Build LSF modifier for one level.
-    Output columns:
-      attempt_number,
-      {label}_clean,        empirical_{label}_clean,
-      {label}_1_3,          empirical_{label}_1_3,
-      {label}_ge4,          empirical_{label}_ge4
+
+    Output columns: attempt_number,
+      {label}_clean, empirical_{label}_clean,
+      {label}_1_3, empirical_{label}_1_3,
+      {label}_ge4, empirical_{label}_ge4
     """
-    logger.info("Fitting Modifier 2 – LSF for '%s'…", label)
+    logger.info("Fitting Modifier 2 – LSF for '%s'...", label)
 
-    clean = _fit_lsf_bin_for_level(df, attempt_col, bin_col, "Clean", label, max_attempt)
-    one_to_three = _fit_lsf_bin_for_level(df, attempt_col, bin_col, "1–3", label, max_attempt)
-    ge4 = _fit_lsf_bin_for_level(df, attempt_col, bin_col, ">=4", label, max_attempt)
+    frames = []
+    for bin_value, suffix in LSF_BINS:
+        fitted = _fit_lsf_bin_for_level(df, attempt_col, bin_col, bin_value, label, max_attempt)
+        frames.append(_rename_fitted_columns(fitted, label, suffix))
 
-    if not clean.empty:
-        clean = clean.rename(columns={label: f"{label}_clean", f"empirical_{label}": f"empirical_{label}_clean"})
-    else:
-        clean = pd.DataFrame(columns=["attempt_number", f"{label}_clean", f"empirical_{label}_clean"])
-
-    if not one_to_three.empty:
-        one_to_three = one_to_three.rename(columns={label: f"{label}_1_3", f"empirical_{label}": f"empirical_{label}_1_3"})
-    else:
-        one_to_three = pd.DataFrame(columns=["attempt_number", f"{label}_1_3", f"empirical_{label}_1_3"])
-
-    if not ge4.empty:
-        ge4 = ge4.rename(columns={label: f"{label}_ge4", f"empirical_{label}": f"empirical_{label}_ge4"})
-    else:
-        ge4 = pd.DataFrame(columns=["attempt_number", f"{label}_ge4", f"empirical_{label}_ge4"])
-
-    out = pd.merge(clean, one_to_three, on="attempt_number", how="outer")
-    out = pd.merge(out, ge4, on="attempt_number", how="outer")
+    # Merge all bins on attempt_number
+    out = frames[0]
+    for frame in frames[1:]:
+        out = pd.merge(out, frame, on="attempt_number", how="outer")
     return out
 
 
-def _fit_bin(df: pd.DataFrame, name: str, keep_cols: list[str] = ["attempt_number", "type", "empirical_type"]) -> pd.DataFrame:
-        df = _safe_fit_rates_model(df[df["type_SinceFail_Bin"] == name], f"SinceFail={name}")
-        if df.empty:
-            return df
-        out = df[keep_cols].copy()
-        return out
+# ---------------------------------------------------------------------------
+# Export helpers
+# ---------------------------------------------------------------------------
 
-def _make_unique_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure DataFrame has unique column names by adding suffixes .1, .2, ..."""
-    counts = {}
-    new_cols = []
-    for c in df.columns:
-        if c not in counts:
-            counts[c] = 0
-            new_cols.append(c)
-        else:
-            counts[c] += 1
-            new_cols.append(f"{c}.{counts[c]}")
-    df = df.copy()
-    df.columns = new_cols
-    return df
+def _export_fallback_rates(fallback_rates: dict[str, pd.DataFrame],
+                           date_tag: str) -> pd.DataFrame:
+    """
+    Export per-level fallback rates and build a combined long table.
+
+    Returns the combined long DataFrame.
+    """
+    all_levels = []
+    for level_name, df_out in fallback_rates.items():
+        # Select minimal columns
+        minimal = ["attempt_number", level_name, f"empirical_{level_name}"]
+        present = [c for c in minimal if c in df_out.columns]
+        export_df = df_out.loc[:, present].copy() if present else _make_unique_columns(df_out)
+        export_df = _make_unique_columns(export_df)
+
+        csv_path = OUTPUT_DIR / f"launch_fallback_rates_{level_name}_{date_tag}.csv"
+        export_df.to_csv(csv_path, index=False)
+        export_df.to_json(csv_path.with_suffix(".json"), orient="records", indent=2)
+
+        # Tag for long table
+        export_df["level"] = level_name
+        all_levels.append(export_df)
+
+    # Build combined long table
+    fallback_long = pd.concat(all_levels, ignore_index=True, sort=False)
+
+    level_names = list(fallback_rates.keys())
+    fallback_long["fitted"] = fallback_long[level_names].sum(axis=1)
+
+    empirical_cols = [f"empirical_{lvl}" for lvl in level_names]
+    present_emp = [c for c in empirical_cols if c in fallback_long.columns]
+    if present_emp:
+        fallback_long["empirical"] = fallback_long[present_emp].sum(axis=1)
+
+    fallback_long = fallback_long[["level", "attempt_number", "fitted", "empirical"]]
+    fallback_long = _make_unique_columns(fallback_long)
+
+    long_csv = OUTPUT_DIR / f"launch_fallback_rates_all_levels_{date_tag}.csv"
+    fallback_long.to_csv(long_csv, index=False)
+    fallback_long.to_json(long_csv.with_suffix(".json"), orient="records", indent=2)
+
+    return fallback_long
+
+
+def _export_modifier_tables(modifiers: dict[str, pd.DataFrame],
+                            prefix: str, date_tag: str) -> None:
+    """Export modifier DataFrames (iteration or LSF) as CSV + JSON."""
+    for level_name, df_mod in modifiers.items():
+        csv_path = OUTPUT_DIR / f"launch_modifier_{prefix}_{level_name}_{date_tag}.csv"
+        _export_csv_json(df_mod, csv_path)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     """
-    Run fallback rate fitting and export:
-      - Fallback base rates
-      - Modifier 1: Type iteration (first vs second+)
-      - Modifier 2: Launches since last failure (Clean, 1–3, >=4)
-      - Provider rating comparison table
-      - Full input data snapshot
+    Run the fallback rate fitting and export pipeline.
+
+    Steps:
+    1. Load and prepare data
+    2. Fit fallback base rates for all hierarchy levels
+    3. Fit Modifier 1: iteration (first vs second+)
+    4. Fit Modifier 2: launches since last failure
+    5. Build provider rating comparison table
+    6. Export all outputs as CSV + JSON
     """
     date_tag = datetime.now(tz=TZ).strftime("%Y%m%d")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Loading and preparing data…")
+    # --- Step 1: Load data ---
+    logger.info("Loading and preparing data...")
     launch_df = load_and_prepare_data()
     logger.info("Loaded %d rows with columns: %s", len(launch_df), list(launch_df.columns))
 
-    # Keep only the needed columns and suffix for clarity
-    keep_cols = ["attempt_number", "type", "empirical_type"]
-
-    # ---------- Fallback base rates ----------
+    # --- Step 2: Fallback base rates ---
     fallback_rates = _base_rates(launch_df)
 
-    # ---------- Modifier 1: Type iteration ----------
-    # Build the three iteration modifiers
+    # --- Step 3: Modifier 1 – Iteration ---
     modifiers_iter = {
-        "type": _modifier_iteration_for_level(
-            launch_df,
-            attempt_col="lv_type_attempt_number",
-            grouped_col="type_iteration_grouped",
-            label="type",
-            max_attempt=20,
-        ),
-        "variant": _modifier_iteration_for_level(
-            launch_df,
-            attempt_col="lv_variant_attempt_number",
-            grouped_col="variant_iteration_grouped",
-            label="variant",
-            max_attempt=20,
-        ),
-        "minor_variant": _modifier_iteration_for_level(
-            launch_df,
-            attempt_col="lv_minor_variant_attempt_number",
-            grouped_col="minor_variant_iteration_grouped",
-            label="minor_variant",
-            max_attempt=20,
-        ),
+        label: _modifier_iteration_for_level(
+            launch_df, attempt_col=attempt_col, grouped_col=grouped_col,
+            label=label, max_attempt=20,
+        )
+        for label, attempt_col, grouped_col in ITERATION_LEVELS
     }
 
-
-    # ---------- Modifier 2: Launches since last failure ----------
+    # --- Step 4: Modifier 2 – Launches since last failure ---
     modifiers_lsf = {
-        "type": _modifier_lsf_for_level(
-            launch_df, attempt_col="lv_type_attempt_number",   bin_col="type_SinceFail_Bin",   label="type",           max_attempt=20
-        ),
-        "family": _modifier_lsf_for_level(
-            launch_df, attempt_col="lv_family_attempt_number", bin_col="family_SinceFail_Bin", label="family",         max_attempt=20
-        ),
-        "variant": _modifier_lsf_for_level(
-            launch_df, attempt_col="lv_variant_attempt_number", bin_col="variant_SinceFail_Bin", label="variant",      max_attempt=20
-        ),
-        "minor_variant": _modifier_lsf_for_level(
-            launch_df, attempt_col="lv_minor_variant_attempt_number", bin_col="minor_variant_SinceFail_Bin", label="minor_variant", max_attempt=20
-        ),
+        label: _modifier_lsf_for_level(
+            launch_df, attempt_col=attempt_col, bin_col=bin_col,
+            label=label, max_attempt=20,
+        )
+        for label, attempt_col, bin_col in LSF_LEVELS
     }
 
-    # ---------- Provider rating comparison ----------
-    logger.info("Creating Provider Rating Comparison Table…")
+    # --- Step 5: Provider rating comparison ---
+    logger.info("Creating Provider Rating Comparison Table...")
     provider_rating_table = provider_rating_comparison_table(
         df=launch_df,
         max_attempt=20,
@@ -301,87 +373,24 @@ def main() -> None:
         exclude_ratings=["N/A", "Unknown", "Not Rated"],
     )
 
-    # ---------- Exports ----------
+    # --- Step 6: Export all outputs ---
     logger.info("Exporting CSVs & JSONs to %s", OUTPUT_DIR)
 
-    # Fallback rates (per level)
-    all_levels = []  # collect rows for the long table
-    for level_name, df_out in fallback_rates.items():
-        # Prefer minimal, self-describing columns
-        minimal = ["attempt_number", level_name, f"empirical_{level_name}"]
-        present = [c for c in minimal if c in df_out.columns]
-        if present:
-            export_df = df_out.loc[:, present].copy()
-        else:
-            # If model didn't output those exact names, dedupe and export everything
-            export_df = _make_unique_columns(df_out)
+    _export_fallback_rates(fallback_rates, date_tag)
+    _export_modifier_tables(modifiers_iter, "iter", date_tag)
+    _export_modifier_tables(modifiers_lsf, "lsf", date_tag)
 
-        # Final guard: JSON requires unique column names
-        export_df = _make_unique_columns(export_df)
-
-        fallback_csv = OUTPUT_DIR / f"launch_fallback_rates_{level_name}_{date_tag}.csv"
-        fallback_json = fallback_csv.with_suffix(".json")
-        export_df.to_csv(fallback_csv, index=False)
-        export_df.to_json(fallback_json, orient="records", indent=2)
-
-        # Add to the long table collection
-        export_df["level"] = level_name  # add a column to identify the level
-        all_levels.append(export_df)
-
-    # --- After the loop: one long table across all levels ---
-    fallback_long = pd.concat(all_levels, ignore_index=True, sort=False)
-
-    # Coalesce level-specific columns into generic 'fitted' and 'empirical' columns.
-    # For each row, only one of the level-specific columns (e.g., 'type', 'family')
-    # will contain a non-NaN value. Using sum(axis=1) is a concise way to pick
-    # that one value, as NaN is treated as 0 in the sum.
-    level_names = list(fallback_rates.keys())
-    fallback_long["fitted"] = fallback_long[level_names].sum(axis=1)
-
-    empirical_cols = [f"empirical_{level}" for level in level_names]
-    present_empirical_cols = [c for c in empirical_cols if c in fallback_long.columns]
-    if present_empirical_cols:
-        fallback_long["empirical"] = fallback_long[present_empirical_cols].sum(axis=1)
-
-    fallback_long = fallback_long[["level", "attempt_number", "fitted", "empirical"]]
-    fallback_long = _make_unique_columns(fallback_long)
-
-
-    fallback_long_csv = OUTPUT_DIR / f"launch_fallback_rates_all_levels_{date_tag}.csv"
-    fallback_long_json = fallback_long_csv.with_suffix(".json")
-    fallback_long.to_csv(fallback_long_csv, index=False)
-    fallback_long.to_json(fallback_long_json, orient="records", indent=2)
-
-    # Modifier – Type Iteration
-    for level_name, df_mod in modifiers_iter.items():
-        export_df = _make_unique_columns(df_mod)
-        iter_csv = OUTPUT_DIR / f"launch_modifier_iter_{level_name}_{date_tag}.csv"
-        export_df.to_csv(iter_csv, index=False)
-        export_df.to_json(iter_csv.with_suffix(".json"), orient="records", indent=2)
-
-
-    # Modifier – Since Last Failure
-    for level_name, df_mod in modifiers_lsf.items():
-        export_df = _make_unique_columns(df_mod)
-        lsf_csv = OUTPUT_DIR / f"launch_modifier_lsf_{level_name}_{date_tag}.csv"
-        export_df.to_csv(lsf_csv, index=False)
-        export_df.to_json(lsf_csv.with_suffix(".json"), orient="records", indent=2)
-
-
-    # Full data
+    # Full data snapshot
     full_csv = OUTPUT_DIR / f"launch_full_data_{date_tag}.csv"
-    full_json = full_csv.with_suffix(".json")
     launch_df.to_csv(full_csv, index=False)
-    launch_df.to_json(full_json, orient="records", indent=2)
+    launch_df.to_json(full_csv.with_suffix(".json"), orient="records", indent=2)
 
-    # Provider Rating Modifier
+    # Provider rating comparison
     prov_csv = OUTPUT_DIR / f"launch_provider_rating_comparison_table_{date_tag}.csv"
-    prov_json = prov_csv.with_suffix(".json")
     provider_rating_table.to_csv(prov_csv, index=False)
-    provider_rating_table.to_json(prov_json, orient="records", indent=2)
+    provider_rating_table.to_json(prov_csv.with_suffix(".json"), orient="records", indent=2)
 
     logger.info("Done.")
-
 
 
 if __name__ == "__main__":
