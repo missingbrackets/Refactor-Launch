@@ -181,9 +181,32 @@ def _add_months_since_last_launch_all_levels(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _add_binned_reliability_combos(df: pd.DataFrame,
+                                   launch_bins=(1, 4, float("inf"))) -> pd.DataFrame:
+    """
+    Add SinceFail_Bin, Attempt_Bin, and combo columns for each grouping level.
+
+    These binned columns are required by the fallback rates pipeline for
+    modifier-2 (launches-since-last-failure) fitting.
+    """
+    for _group_col, attempt_col, prefix in GROUPING_LEVELS:
+        since_fail_col = f"{prefix}_launches_since_last_failure"
+        if since_fail_col not in df.columns:
+            continue
+        df = add_binned_reliability_combo(
+            df,
+            attempt_col=attempt_col,
+            since_fail_col=since_fail_col,
+            launch_bins=launch_bins,
+            prefix=prefix,
+        )
+    return df
+
+
 def _add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add LSF bins and months-since-last-launch for all levels."""
+    """Add LSF, binned reliability combos, and months-since-last-launch for all levels."""
     df = _add_lsf_and_bins_for_levels(df, GROUPING_LEVELS, launch_bins=(1, 4, float("inf")))
+    df = _add_binned_reliability_combos(df, launch_bins=(1, 4, float("inf")))
     df = _add_months_since_last_launch_all_levels(df)
     return df
 
